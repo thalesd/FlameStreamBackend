@@ -27,6 +27,7 @@ builder.Services.AddOpenApi();
 
 var registry = new TranscodeRegistry(maxConcurrent: 5);
 builder.Services.AddSingleton(registry);
+builder.Services.AddSingleton<IHostedService>(registry);
 
 var app = builder.Build();
 
@@ -35,7 +36,6 @@ Directory.CreateDirectory(libraryRoot);
 Directory.CreateDirectory(cacheRoot);
 
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
-lifetime.ApplicationStopping.Register(() => registry.StopAll());
 AppDomain.CurrentDomain.ProcessExit += (_, __) => registry.StopAll();
 
 // Configure the HTTP request pipeline.
@@ -82,23 +82,23 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 // Background idle killer
+var appStopping = lifetime.ApplicationStopping;
 _ = Task.Run(async () =>
 {
     var timer = new PeriodicTimer(idleCheckInterval);
-    while (await timer.WaitForNextTickAsync())
+    while (await timer.WaitForNextTickAsync(appStopping).ConfigureAwait(false))
     {
         var now = DateTime.UtcNow;
         foreach (var kv in lastAccessUtc.ToArray())
         {
             if (now - kv.Value > idleTimeout)
             {
-                // kv.Key is the hash = our registry key
                 registry.Stop(kv.Key);
                 lastAccessUtc.TryRemove(kv.Key, out _);
             }
         }
     }
-});
+}, appStopping);
 
 //Helpers
 string HashId(string s) => Convert.ToHexString(MD5.HashData(System.Text.Encoding.UTF8.GetBytes(s))).ToLowerInvariant();
@@ -207,7 +207,7 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
             {
                 // Fallback to CPU
                 args.AddRange(new[] { "-i", src });
-                args.AddRange(new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "23" });
+                args.AddRange(new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-tune", "zerolatency" });
             }
 
             args.Add("-pix_fmt"); args.Add("yuv420p");
@@ -230,14 +230,13 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
             args.AddRange(new List<string>
             {
                 "-map", "0:v:0", "-map", "0:a:0",
-                "-tune", "zerolatency",
                 "-hls_time", hlsSegmentDuration.ToString(),
-                "-hls_flags", "independent_segments+append_list+temp_file",
+                "-hls_flags", "independent_segments",
                 "-hls_segment_filename", segPattern,
                 "-force_key_frames",$"expr:gte(t,n_forced*{hlsSegmentDuration})",
                 "-start_number","0",
                 "-hls_list_size", "0",
-                "-hls_playlist_type", "vod",
+                "-hls_playlist_type", "event",
                 playlist
             });
 
@@ -251,39 +250,27 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
                 CreateNoWindow = true
             };
 
-            var reportPath = Path.Combine(outDir, "ffmpeg_report.log");
-
-            // Use ArgumentList to avoid quoting issues
             foreach (var a in args) psi.ArgumentList.Add(a);
 
-            if (subtitleFile != null)
-            {
-                var subArgs = new List<string>
-                {
-                    "-hide_banner", "-y", "-nostdin",
-                    "-loglevel", "info", "-report",
-                    "-c:s", "webvtt",
-                    "-i", subtitleFile
-                };
-            }
-
-            Console.WriteLine($"[HLS] ffmpeg start\n  src: {src}\n  outDir: {outDir}\n  segPattern: {segPattern}\n  playlist: {playlist}");
+            Console.WriteLine($"[HLS] ffmpeg start\n  cmd: ffmpeg {string.Join(" ", args)}\n  outDir: {outDir}");
 
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    // Start & track under the hash key
                     var proc = await ctx.RequestServices
                         .GetRequiredService<TranscodeRegistry>()
                         .StartAsync(hash, psi);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[HLS] Failed to start ffmpeg: {ex.Message}");
+                }
             });
 
             // Wait briefly so index.m3u8 exists before replying
             var sw = Stopwatch.StartNew();
-            while (!System.IO.File.Exists(playlist) && sw.Elapsed < TimeSpan.FromSeconds(5))
+            while (!System.IO.File.Exists(playlist) && sw.Elapsed < TimeSpan.FromSeconds(30))
                 await Task.Delay(200);
 
             if (!File.Exists(playlist))
@@ -391,11 +378,66 @@ app.MapGet("/api/media", () =>
                 name = Path.GetFileName(f),
                 path = relPath,
                 url = $"/stream/{Uri.EscapeDataString(relPath)}.m3u8",
-                subUrl = $"/subs/{Uri.EscapeDataString(relPath)}_vtt.m3u8"
+                subUrl = (File.Exists(subtitleVtt) || File.Exists(subtitleSrt))
+                    ? $"/subs/{Uri.EscapeDataString(relPath)}"
+                    : null
             };
         });
 
     return Results.Ok(files);
+});
+
+app.MapGet("/subs/{**path}", async (string path) =>
+{
+    try
+    {
+        var src = SafeUnder(libraryRoot, path);
+        var basePath = Path.ChangeExtension(src, null); // remove extensão
+
+        // Procura legenda: .vtt tem prioridade, senão .srt
+        var vttPath = basePath + ".vtt";
+        var srtPath = basePath + ".srt";
+
+        // Se já existe .vtt, serve direto
+        if (File.Exists(vttPath))
+            return Results.File(vttPath, "text/vtt");
+
+        // Se existe .srt, converte para .vtt e faz cache
+        if (File.Exists(srtPath))
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "ffmpeg",
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            psi.ArgumentList.Add("-hide_banner");
+            psi.ArgumentList.Add("-y");
+            psi.ArgumentList.Add("-i");
+            psi.ArgumentList.Add(srtPath);
+            psi.ArgumentList.Add(vttPath);
+
+            using var proc = Process.Start(psi)!;
+            await proc.WaitForExitAsync();
+
+            if (proc.ExitCode == 0 && File.Exists(vttPath))
+                return Results.File(vttPath, "text/vtt");
+
+            return Results.StatusCode(500);
+        }
+
+        return Results.NotFound();
+    }
+    catch (UnauthorizedAccessException)
+    {
+        return Results.BadRequest();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine("[SUBS] Exception: " + ex);
+        return Results.StatusCode(500);
+    }
 });
 
 app.Run();
