@@ -142,18 +142,24 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
 {
     Console.WriteLine($"Request received for /stream/{path}");
 
-    // path might be "Movie.mp4.m3u8"
     if (!path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
         return Results.BadRequest(new { error = "Stream endpoint requires .m3u8 suffix." });
 
     var clean = path[..^5]; // strip ".m3u8"
+
+    // Snap the requested start time to the nearest segment boundary for cache reuse
+    ctx.Request.Query.TryGetValue("start", out var startStr);
+    double.TryParse(startStr, System.Globalization.NumberStyles.Any,
+        System.Globalization.CultureInfo.InvariantCulture, out var rawStart);
+    var startTime = Math.Floor(rawStart / hlsSegmentDuration) * hlsSegmentDuration;
+    var startNumber = (int)(startTime / hlsSegmentDuration);
 
     try
     {
         var src = SafeUnder(libraryRoot, clean);
         if (!File.Exists(src)) return Results.NotFound();
 
-        var hash = HashId(src);
+        var hash = HashId(startTime > 0 ? $"{src}@{startTime}" : src);
         var outDir = Path.Combine(cacheRoot, hash);
         var playlist = Path.Combine(outDir, "stream.m3u8");
         var segPattern = Path.Combine(outDir, "seg_%05d.ts");
@@ -193,6 +199,12 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
                 "-hide_banner", "-y", "-nostdin", "-loglevel", "info"
             };
 
+            if (startTime > 0)
+            {
+                args.Add("-ss");
+                args.Add(startTime.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
+            }
+
             if (hwType.Equals("Nvidia", StringComparison.OrdinalIgnoreCase))
             {
                 args.AddRange(new[] { "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", src });
@@ -205,7 +217,6 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
             }
             else
             {
-                // Fallback to CPU
                 args.AddRange(new[] { "-i", src });
                 args.AddRange(new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-tune", "zerolatency" });
             }
@@ -234,7 +245,7 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
                 "-hls_flags", "independent_segments",
                 "-hls_segment_filename", segPattern,
                 "-force_key_frames",$"expr:gte(t,n_forced*{hlsSegmentDuration})",
-                "-start_number","0",
+                "-start_number", startNumber.ToString(),
                 "-hls_list_size", "0",
                 "-hls_playlist_type", "event",
                 playlist
