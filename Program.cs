@@ -359,33 +359,140 @@ string? GetVideoSubtitles(string inputFile)
     return subtitleFile;
 }
 
-app.MapGet("/api/media", () =>
+List<(int index, string language, string title, string codec)> GetEmbeddedSubtitles(string inputFile)
 {
-    var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".mp4", ".mkv", ".mov", ".avi" };
-    var files = Directory.GetFiles(libraryRoot, "*.*", SearchOption.TopDirectoryOnly)
-        .Where(f => exts.Contains(Path.GetExtension(f)))
-        .Select(f =>
+    var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { "subrip", "ass", "ssa", "webvtt", "mov_text", "ttml", "sami", "microdvd", "text" };
+
+    var psi = new ProcessStartInfo
+    {
+        FileName = "ffprobe",
+        RedirectStandardOutput = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+    psi.ArgumentList.Add("-v"); psi.ArgumentList.Add("quiet");
+    psi.ArgumentList.Add("-print_format"); psi.ArgumentList.Add("json");
+    psi.ArgumentList.Add("-show_streams"); psi.ArgumentList.Add("-select_streams"); psi.ArgumentList.Add("s");
+    psi.ArgumentList.Add(inputFile);
+
+    using var proc = Process.Start(psi)!;
+    string output = proc.StandardOutput.ReadToEnd();
+    proc.WaitForExit();
+
+    var result = new List<(int, string, string, string)>();
+    if (string.IsNullOrEmpty(output)) return result;
+
+    using var doc = JsonDocument.Parse(output);
+    if (!doc.RootElement.TryGetProperty("streams", out var streams)) return result;
+
+    int idx = 0;
+    foreach (var stream in streams.EnumerateArray())
+    {
+        var codec = stream.TryGetProperty("codec_name", out var cn) ? cn.GetString() ?? "" : "";
+        if (!supported.Contains(codec)) { idx++; continue; }
+
+        string language = "", title = "";
+        if (stream.TryGetProperty("tags", out var tags))
         {
-            var relPath = Path.GetRelativePath(libraryRoot, f).Replace("\\", "/");
-            var subtitleSrt = Path.ChangeExtension(f, ".srt");
-            var subtitleVtt = Path.ChangeExtension(f, ".vtt");
-            string? subtitle = null;
-            if (File.Exists(subtitleVtt)) subtitle = Path.GetFileName(subtitleVtt);
-            else if (File.Exists(subtitleSrt)) subtitle = Path.GetFileName(subtitleSrt);
+            if (tags.TryGetProperty("language", out var lang)) language = lang.GetString() ?? "";
+            if (tags.TryGetProperty("title", out var t)) title = t.GetString() ?? "";
+        }
+        result.Add((idx++, language, title, codec));
+    }
 
-            return new
+    return result;
+}
+
+(double duration, int width, int height) GetMediaInfo(string inputFile)
+{
+    var psi = new ProcessStartInfo
+    {
+        FileName = "ffprobe",
+        RedirectStandardOutput = true,
+        UseShellExecute = false,
+        CreateNoWindow = true
+    };
+    psi.ArgumentList.Add("-v"); psi.ArgumentList.Add("quiet");
+    psi.ArgumentList.Add("-print_format"); psi.ArgumentList.Add("json");
+    psi.ArgumentList.Add("-show_format");
+    psi.ArgumentList.Add("-show_streams"); psi.ArgumentList.Add("-select_streams"); psi.ArgumentList.Add("v:0");
+    psi.ArgumentList.Add(inputFile);
+
+    using var proc = Process.Start(psi)!;
+    string output = proc.StandardOutput.ReadToEnd();
+    proc.WaitForExit();
+
+    if (string.IsNullOrEmpty(output)) return (0, 0, 0);
+    using var doc = JsonDocument.Parse(output);
+
+    double duration = 0;
+    int width = 0, height = 0;
+
+    if (doc.RootElement.TryGetProperty("format", out var fmt) &&
+        fmt.TryGetProperty("duration", out var dur) &&
+        double.TryParse(dur.GetString(), System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out var d))
+        duration = d;
+
+    if (doc.RootElement.TryGetProperty("streams", out var streams) && streams.GetArrayLength() > 0)
+    {
+        if (streams[0].TryGetProperty("width", out var w)) width = w.GetInt32();
+        if (streams[0].TryGetProperty("height", out var h)) height = h.GetInt32();
+    }
+
+    return (duration, width, height);
+}
+
+var mediaExts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".mp4", ".mkv", ".mov", ".avi" };
+
+List<object> BuildMediaTree(string dir, string relBase)
+{
+    var entries = new List<object>();
+
+    foreach (var subDir in Directory.GetDirectories(dir).OrderBy(d => d))
+    {
+        var dirName = Path.GetFileName(subDir)!;
+        var relPath = string.IsNullOrEmpty(relBase) ? dirName : $"{relBase}/{dirName}";
+        entries.Add(new { type = "folder", name = dirName, path = relPath, children = BuildMediaTree(subDir, relPath) });
+    }
+
+    foreach (var f in Directory.GetFiles(dir).Where(f => mediaExts.Contains(Path.GetExtension(f))).OrderBy(f => f))
+    {
+        var fileName = Path.GetFileName(f);
+        var relPath = string.IsNullOrEmpty(relBase) ? fileName : $"{relBase}/{fileName}";
+        var escaped = string.Join("/", relPath.Split('/').Select(Uri.EscapeDataString));
+        var subtitleSrt = Path.ChangeExtension(f, ".srt");
+        var subtitleVtt = Path.ChangeExtension(f, ".vtt");
+        var embedded = GetEmbeddedSubtitles(f);
+        var (duration, width, height) = GetMediaInfo(f);
+
+        entries.Add(new
+        {
+            type = "file",
+            name = fileName,
+            path = relPath,
+            url = $"/stream/{escaped}.m3u8",
+            subUrl = (File.Exists(subtitleVtt) || File.Exists(subtitleSrt))
+                ? $"/subs/{escaped}"
+                : null,
+            embeddedSubtitles = embedded.Select(s => new
             {
-                name = Path.GetFileName(f),
-                path = relPath,
-                url = $"/stream/{Uri.EscapeDataString(relPath)}.m3u8",
-                subUrl = (File.Exists(subtitleVtt) || File.Exists(subtitleSrt))
-                    ? $"/subs/{Uri.EscapeDataString(relPath)}"
-                    : null
-            };
+                url = $"/subs/{escaped}?track={s.index}",
+                s.language,
+                s.title,
+                s.codec
+            }).ToArray(),
+            duration,
+            width,
+            height
         });
+    }
 
-    return Results.Ok(files);
-});
+    return entries;
+}
+
+app.MapGet("/api/media", () => Results.Ok(BuildMediaTree(libraryRoot, "")));
 
 app.MapGet("/subs/{**path}", async (string path) =>
 {
