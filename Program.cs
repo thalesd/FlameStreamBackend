@@ -59,17 +59,21 @@ var lastAccessUtc = new ConcurrentDictionary<string, DateTime>();
 // Track the currently active seek job per base file: baseHash -> seekHash
 var activeSeekJobs = new ConcurrentDictionary<string, string>();
 
-// Update last - access before static files handle /hls/**
+// Map each job key (baseHash or seekHash) to its output directory
+var jobPaths = new ConcurrentDictionary<string, string>();
+
+// Update last-access before static files handle /hls/**
+// Handles both /hls/{baseHash}/... and /hls/{baseHash}/temp/{seekHash}/...
 app.Use(async (ctx, next) =>
 {
     if (ctx.Request.Path.StartsWithSegments("/hls", out var remainder))
     {
-        // Expect /hls/{hash}/...
-        var segments = remainder.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (segments is { Length: >= 1 })
+        var segs = remainder.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segs is { Length: >= 1 })
         {
-            var hash = segments[0];
-            lastAccessUtc[hash] = DateTime.UtcNow;
+            lastAccessUtc[segs[0]] = DateTime.UtcNow;
+            if (segs.Length >= 3 && segs[1] == "temp")
+                lastAccessUtc[segs[2]] = DateTime.UtcNow;
         }
     }
     await next();
@@ -99,26 +103,23 @@ _ = Task.Run(async () =>
                 registry.Stop(kv.Key);
                 lastAccessUtc.TryRemove(kv.Key, out _);
 
-                // Delete incomplete encodings; keep completed videos
-                var cacheDir = Path.Combine(cacheRoot, kv.Key);
+                // Resolve directory: prefer jobPaths entry, fall back to cacheRoot/{key} for legacy
+                jobPaths.TryRemove(kv.Key, out var cacheDir);
+                cacheDir ??= Path.Combine(cacheRoot, kv.Key);
+
                 try
                 {
                     if (Directory.Exists(cacheDir))
                     {
                         var playlistFile = Path.Combine(cacheDir, "stream.m3u8");
-                        if (File.Exists(playlistFile))
+                        if (File.Exists(playlistFile) && !File.ReadAllText(playlistFile).Contains("#EXT-X-ENDLIST"))
                         {
-                            var content = File.ReadAllText(playlistFile);
-                            // If encoding is incomplete (no ENDLIST), delete the cache
-                            if (!content.Contains("#EXT-X-ENDLIST"))
-                            {
-                                Console.WriteLine($"[Idle] Deleting incomplete cache: {kv.Key}");
-                                Directory.Delete(cacheDir, true);
-                            }
-                            else
-                            {
-                                Console.WriteLine($"[Idle] Keeping completed video cache: {kv.Key}");
-                            }
+                            Console.WriteLine($"[Idle] Deleting incomplete cache: {kv.Key}");
+                            Directory.Delete(cacheDir, true);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[Idle] Keeping completed cache: {kv.Key}");
                         }
                     }
                 }
@@ -127,6 +128,25 @@ _ = Task.Run(async () =>
                     Console.Error.WriteLine($"[Idle] Error cleaning cache {kv.Key}: {ex.Message}");
                 }
             }
+        }
+
+        // Clean up temp seek dirs under any fully-completed main encoding
+        try
+        {
+            foreach (var mainDir in Directory.GetDirectories(cacheRoot))
+            {
+                var tempDir = Path.Combine(mainDir, "temp");
+                if (!Directory.Exists(tempDir)) continue;
+                var mainPlaylist = Path.Combine(mainDir, "stream.m3u8");
+                if (!File.Exists(mainPlaylist)) continue;
+                if (!File.ReadAllText(mainPlaylist).Contains("#EXT-X-ENDLIST")) continue;
+                Directory.Delete(tempDir, true);
+                Console.WriteLine($"[Idle] Deleted temp dir for completed encoding: {Path.GetFileName(mainDir)}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Idle] Error during temp cleanup: {ex.Message}");
         }
     }
 }, appStopping);
@@ -150,6 +170,19 @@ static string Mime(string path) => Path.GetExtension(path).ToLowerInvariant() sw
     ".vtt" => "text/vtt",
     _ => "application/octet-stream"
 };
+
+string MainDir(string baseHash) => Path.Combine(cacheRoot, baseHash);
+string TempDir(string baseHash, string seekHash) => Path.Combine(cacheRoot, baseHash, "temp", seekHash);
+
+// Count how many segments FFmpeg has written to the playlist so far.
+// More reliable than File.Exists: FFmpeg appends the segment to the playlist only
+// after it is fully flushed to disk, so a count > N means segment N is readable.
+int CountEncodedSegments(string playlistPath)
+{
+    if (!File.Exists(playlistPath)) return 0;
+    try { return File.ReadAllLines(playlistPath).Count(l => l.TrimEnd().EndsWith(".ts", StringComparison.OrdinalIgnoreCase)); }
+    catch { return 0; }
+}
 
 // ---------- Progressive file (keep for testing) ----------
 app.MapGet("/media/{**path}", (string path) =>
@@ -176,7 +209,7 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
     if (!path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
         return Results.BadRequest(new { error = "Stream endpoint requires .m3u8 suffix." });
 
-    var clean = path[..^5]; // strip ".m3u8"
+    var clean = path[..^5];
 
     ctx.Request.Query.TryGetValue("start", out var startStr);
     double.TryParse(startStr, System.Globalization.NumberStyles.Any,
@@ -188,188 +221,74 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
         var src = SafeUnder(libraryRoot, clean);
         if (!File.Exists(src)) return Results.NotFound();
 
-        // Determine if we need pre-segmentation (seeking to a specific time)
-        var baseHash = HashId(src);
-        var hash = baseHash;
-        var seekOffset = 0;
+        var baseHash     = HashId(src);
+        var mainDir      = MainDir(baseHash);
+        var mainPlaylist = Path.Combine(mainDir, "stream.m3u8");
 
-        var useOriginalForSeek = false;
+        // Always ensure the full-file encoding is running
+        if (!IsPlaylistComplete(mainPlaylist) && !registry.IsRunning(baseHash))
+        {
+            Console.WriteLine($"[HLS] Starting main encoding for {baseHash}");
+            StartFfmpegJob(baseHash, mainDir, src, 0.0);
+        }
+
+        // Determine which job/dir serves this request
+        string hash, outDir, urlBase;
+        bool useOriginalForSeek;
 
         if (startSeconds > 0)
         {
-            // If the original encoding has already produced the needed segment, use it directly
-            var originalSegFile = Path.Combine(cacheRoot, baseHash, $"seg_{startSegment:D5}.ts");
-            if (File.Exists(originalSegFile))
+            // Check if main encoding has already produced the needed segment.
+            // CountEncodedSegments reads the playlist; FFmpeg appends a segment entry only
+            // after the .ts file is fully flushed, so this is race-free.
+            if (CountEncodedSegments(mainPlaylist) > startSegment)
             {
-                hash = baseHash;
+                hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
                 useOriginalForSeek = true;
-                Console.WriteLine($"[HLS] Original has segment {startSegment}, serving from main stream");
+                Console.WriteLine($"[HLS] Main has segment {startSegment}, serving from main stream");
 
-                // Clean up the stale seek job now that the original covers this position
-                if (activeSeekJobs.TryRemove(baseHash, out var obsoleteHash))
+                if (activeSeekJobs.TryRemove(baseHash, out var obsoleteSeekHash))
                 {
-                    if (!IsPlaylistComplete(Path.Combine(cacheRoot, baseHash, "stream.m3u8")))
-                    {
-                        Console.WriteLine($"[HLS] Cleaning up seek job {obsoleteHash} (original caught up)");
-                        CleanupSeekJob(obsoleteHash);
-                    }
+                    Console.WriteLine($"[HLS] Cleaning up seek job {obsoleteSeekHash} (main caught up)");
+                    CleanupSeekJob(baseHash, obsoleteSeekHash);
                 }
             }
             else
             {
-                // Original hasn't reached this point yet — use a separate encoding job
-                hash = HashId($"{src}_{startSeconds}");
-                seekOffset = startSegment;
-                Console.WriteLine($"[HLS] Pre-segmentation: user requested start at {startSeconds}s");
+                var seekHash = HashId($"{src}_{startSeconds}");
+                hash = seekHash; outDir = TempDir(baseHash, seekHash); urlBase = $"/hls/{baseHash}/temp/{seekHash}";
+                useOriginalForSeek = false;
+                Console.WriteLine($"[HLS] Main doesn't have segment {startSegment} yet, using seek job {seekHash}");
 
-                // User seeked to a different position: stop the previous seek job while original is still processing
-                if (activeSeekJobs.TryGetValue(baseHash, out var prevSeekHash) && prevSeekHash != hash)
+                if (activeSeekJobs.TryGetValue(baseHash, out var prevSeekHash) && prevSeekHash != seekHash)
                 {
-                    if (!IsPlaylistComplete(Path.Combine(cacheRoot, baseHash, "stream.m3u8")))
-                    {
-                        Console.WriteLine($"[HLS] New seek position, stopping previous seek job {prevSeekHash}");
-                        activeSeekJobs.TryRemove(baseHash, out _);
-                        CleanupSeekJob(prevSeekHash);
-                    }
+                    Console.WriteLine($"[HLS] New seek position — stopping previous seek job {prevSeekHash}");
+                    activeSeekJobs.TryRemove(baseHash, out _);
+                    CleanupSeekJob(baseHash, prevSeekHash);
                 }
-
-                // Register this as the active seek job for this file
-                activeSeekJobs[baseHash] = hash;
+                activeSeekJobs[baseHash] = seekHash;
             }
         }
+        else
+        {
+            hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
+            useOriginalForSeek = false;
+        }
 
-        var outDir = Path.Combine(cacheRoot, hash);
-        var playlist = Path.Combine(outDir, "stream.m3u8");
-        var segPattern = Path.Combine(outDir, "seg_%05d.ts");
-
-        // Touch last-access so idle killer doesn't nuke newly-started jobs
         lastAccessUtc[hash] = DateTime.UtcNow;
+
+        var playlist = Path.Combine(outDir, "stream.m3u8");
 
         if (!File.Exists(playlist))
         {
-            Directory.CreateDirectory(outDir);
-
-            var audioCodec = GetAudioCodec(src);
-            var videoCodec = GetVideoCodec(src);
-            var subtitleFile = GetVideoSubtitles(src);
-
-            if (subtitleFile != null && subtitleFile.EndsWith(".srt"))
+            if (startSeconds > 0 && !useOriginalForSeek)
             {
-                var vttPath = Path.ChangeExtension(subtitleFile, ".vtt");
-                var convertArgs = new[] { "-i", subtitleFile, vttPath };
-                var convertPsi = new ProcessStartInfo
-                {
-                    FileName = "ffmpeg",
-                    UseShellExecute = false,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true,
-                    CreateNoWindow = true
-                };
-                foreach (var a in convertArgs) convertPsi.ArgumentList.Add(a);
-                using var convertProc = Process.Start(convertPsi);
-                convertProc.WaitForExit();
-                subtitleFile = vttPath;
+                Console.WriteLine($"[HLS] Starting seek encoding from {startSeconds}s");
+                StartFfmpegJob(hash, outDir, src, startSeconds);
             }
 
-            // Transcode to H.264/AAC HLS (works for any input)
-            var args = new List<string>
-            {
-                "-hide_banner", "-y", "-nostdin", "-loglevel", "info"
-            };
-
-            // If pre-segmenting, seek to start time before encoding (much faster)
-            if (startSeconds > 0)
-            {
-                args.Add("-ss");
-                args.Add(startSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                Console.WriteLine($"[HLS] FFmpeg will seek to {startSeconds}s before encoding");
-            }
-
-            if (hwType.Equals("Nvidia", StringComparison.OrdinalIgnoreCase))
-            {
-                args.AddRange(new[] { "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", src });
-                args.AddRange(new[] { "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "5M" });
-            }
-            else if (hwType.Equals("Amd", StringComparison.OrdinalIgnoreCase))
-            {
-                args.AddRange(new[] { "-hwaccel", "dxva2", "-i", src });
-                args.AddRange(new[] { "-c:v", "h264_amf", "-b:v", "5M", "-profile:v", "high", "-level", "4.1" });
-            }
-            else
-            {
-                args.AddRange(new[] { "-i", src });
-                args.AddRange(new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-tune", "zerolatency" });
-            }
-
-            args.Add("-pix_fmt"); args.Add("yuv420p");
-
-            if(audioCodec == "aac")
-            {
-                args.AddRange(new List<string>
-                {
-                    "-c:a", "copy"
-                });
-            }
-            else
-            {
-                args.AddRange(new List<string>
-                {
-                    "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000"
-                });
-            }
-
-            // Shift output PTS to match the original file's timeline so video.currentTime
-            // stays accurate even though FFmpeg restarted encoding from t=0 internally.
-            if (startSeconds > 0)
-            {
-                args.Add("-output_ts_offset");
-                args.Add(startSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            }
-
-            args.AddRange(new List<string>
-            {
-                "-map", "0:v:0", "-map", "0:a:0",
-                "-hls_time", hlsSegmentDuration.ToString(),
-                "-hls_flags", "independent_segments",
-                "-hls_segment_filename", segPattern,
-                "-force_key_frames",$"expr:gte(t,n_forced*{hlsSegmentDuration})",
-                "-start_number", "0",
-                "-hls_list_size", "0",
-                "-hls_playlist_type", "event",
-                playlist
-            });
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "ffmpeg",
-                WorkingDirectory = outDir,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = false,
-                CreateNoWindow = true
-            };
-
-            foreach (var a in args) psi.ArgumentList.Add(a);
-
-            Console.WriteLine($"[HLS] ffmpeg start\n  cmd: ffmpeg {string.Join(" ", args)}\n  outDir: {outDir}");
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    var proc = await ctx.RequestServices
-                        .GetRequiredService<TranscodeRegistry>()
-                        .StartAsync(hash, psi);
-                }
-                catch (Exception ex)
-                {
-                    Console.Error.WriteLine($"[HLS] Failed to start ffmpeg: {ex.Message}");
-                }
-            });
-
-            // Wait briefly so index.m3u8 exists before replying
             var sw = Stopwatch.StartNew();
-            while (!System.IO.File.Exists(playlist) && sw.Elapsed < TimeSpan.FromSeconds(30))
+            while (!File.Exists(playlist) && sw.Elapsed < TimeSpan.FromSeconds(30))
                 await Task.Delay(200);
 
             if (!File.Exists(playlist))
@@ -379,14 +298,9 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
             }
         }
 
-        // No seek — serve playlist dynamically so the Chromecast (and other strict
-        // HLS clients) always get segments that are fully written. Redirecting to the
-        // static file caused failures: clients received a playlist before FFmpeg had
-        // finished writing the first segments, then got partial .ts files and gave up.
+        // No seek — wait for at least 2 segments then serve dynamic playlist
         if (startSegment == 0 && startSeconds <= 0)
         {
-            // Wait until at least 2 segments exist so the client can start buffering
-            // immediately after receiving the playlist.
             var seg1 = Path.Combine(outDir, "seg_00001.ts");
             if (!File.Exists(seg1))
             {
@@ -396,64 +310,44 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
                 Console.WriteLine($"[HLS] Waited {segSw.Elapsed.TotalSeconds:F1}s for initial segments");
             }
             ctx.Response.Headers["Cache-Control"] = "no-cache, no-store";
-            var pl = BuildSubPlaylist(playlist, hash, 0, null);
+            var pl = BuildSubPlaylist(playlist, urlBase, 0, null);
             Console.WriteLine($"[HLS] Serving dynamic playlist from segment 0");
             return Results.Content(pl, "application/vnd.apple.mpegurl");
         }
 
-        // For pre-segmented seeks the new job always starts encoding from 0 (FFmpeg seeked ahead).
-        // When using the original stream for a seek, target the actual segment index.
+        // For seek jobs FFmpeg internally starts from 0; when using the original stream,
+        // target the actual segment index.
         var targetSegment = (startSeconds > 0 && !useOriginalForSeek) ? 0 : startSegment;
 
-        // Seek — wait until FFmpeg has encoded past the target segment
-        var targetSegFile = Path.Combine(outDir, $"seg_{targetSegment:D5}.ts");
+        // Wait until the playlist shows the target segment as fully written
         var seekSw = Stopwatch.StartNew();
-        const int maxWaitSeconds = 600; // 10 minutes
-        
-        while (!File.Exists(targetSegFile) && seekSw.Elapsed < TimeSpan.FromSeconds(maxWaitSeconds))
+        const int maxWaitSeconds = 600;
+
+        while (CountEncodedSegments(playlist) <= targetSegment && seekSw.Elapsed < TimeSpan.FromSeconds(maxWaitSeconds))
         {
-            // Check playlist to see if it's marked as complete
-            var playlistLines = File.ReadAllLines(playlist);
-            bool isComplete = Array.Exists(playlistLines, line => line == "#EXT-X-ENDLIST");
-            
-            if (isComplete)
+            if (IsPlaylistComplete(playlist))
             {
-                // File is complete, if segment doesn't exist, it's beyond the file
-                Console.WriteLine($"[HLS] File encoding complete, but segment {targetSegment} not found.");
+                Console.WriteLine($"[HLS] Encoding complete, segment {targetSegment} not found.");
                 break;
             }
-            
-            // Still encoding, wait a bit and retry
             await Task.Delay(500);
         }
 
         if (seekSw.Elapsed > TimeSpan.FromSeconds(5))
             Console.WriteLine($"[HLS] Segment wait completed in {seekSw.Elapsed.TotalSeconds:F1}s");
 
-        if (!File.Exists(targetSegFile))
+        if (CountEncodedSegments(playlist) <= targetSegment)
         {
-            Console.Error.WriteLine($"[HLS] Seek target seg_{targetSegment:D5}.ts not available after {seekSw.Elapsed.TotalSeconds:F1}s timeout.");
-            
-            // Check if file is still being encoded
-            var playlistLines = File.ReadAllLines(playlist);
-            bool isComplete = Array.Exists(playlistLines, line => line == "#EXT-X-ENDLIST");
-            
-            if (isComplete)
+            if (IsPlaylistComplete(playlist))
             {
-                Console.Error.WriteLine($"[HLS] File is complete. Requested segment {targetSegment} is beyond file duration.");
-                return Results.StatusCode(416); // Range Not Satisfiable
+                Console.Error.WriteLine($"[HLS] Segment {targetSegment} is beyond file duration.");
+                return Results.StatusCode(416);
             }
-            else
-            {
-                Console.Error.WriteLine($"[HLS] File is still being encoded. Serving from last available segment.");
-                // Fall through to BuildSubPlaylist which will serve from last available segment
-            }
+            Console.Error.WriteLine($"[HLS] Still encoding; BuildSubPlaylist will serve from last available segment.");
         }
 
-        // For seek jobs the sub-playlist must declare the correct timeline position via
-        // MEDIA-SEQUENCE so HLS.js knows the stream starts at startSeconds, not at 0.
         int? mediaSeq = (startSeconds > 0 && !useOriginalForSeek) ? startSegment : null;
-        var subPlaylist = BuildSubPlaylist(playlist, hash, targetSegment, mediaSeq);
+        var subPlaylist = BuildSubPlaylist(playlist, urlBase, targetSegment, mediaSeq);
         Console.WriteLine($"[HLS] Serving sub-playlist from segment {targetSegment}");
         return Results.Content(subPlaylist, "application/vnd.apple.mpegurl");
     }
@@ -464,7 +358,7 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path) =>
     }
 });
 
-string BuildSubPlaylist(string playlistPath, string hash, int startSegment, int? mediaSequenceOverride = null)
+string BuildSubPlaylist(string playlistPath, string urlBase, int startSegment, int? mediaSequenceOverride = null)
 {
     var lines = File.ReadAllLines(playlistPath);
     var sb = new System.Text.StringBuilder();
@@ -521,7 +415,7 @@ string BuildSubPlaylist(string playlistPath, string hash, int startSegment, int?
     for (int i = from; i < segments.Count; i++)
     {
         sb.AppendLine(segments[i].extinf);
-        sb.AppendLine($"/hls/{hash}/{segments[i].file}");
+        sb.AppendLine($"{urlBase}/{segments[i].file}");
     }
 
     if (hasEndList)
@@ -537,17 +431,100 @@ bool IsPlaylistComplete(string playlistPath)
     catch { return false; }
 }
 
-void CleanupSeekJob(string seekHash)
+void CleanupSeekJob(string baseHash, string seekHash)
 {
     registry.Stop(seekHash);
     lastAccessUtc.TryRemove(seekHash, out _);
-    var dir = Path.Combine(cacheRoot, seekHash);
+    jobPaths.TryRemove(seekHash, out _);
+    var dir = TempDir(baseHash, seekHash);
     if (!Directory.Exists(dir)) return;
     if (!IsPlaylistComplete(Path.Combine(dir, "stream.m3u8")))
     {
         try { Directory.Delete(dir, true); }
         catch (Exception ex) { Console.Error.WriteLine($"[Seek] Failed to delete seek cache {seekHash}: {ex.Message}"); }
     }
+}
+
+void StartFfmpegJob(string key, string outDir, string src, double startSeconds)
+{
+    Directory.CreateDirectory(outDir);
+
+    var audioCodec = GetAudioCodec(src);
+    var playlist   = Path.Combine(outDir, "stream.m3u8");
+    var segPattern = Path.Combine(outDir, "seg_%05d.ts");
+
+    var args = new List<string> { "-hide_banner", "-y", "-nostdin", "-loglevel", "info" };
+
+    if (startSeconds > 0)
+    {
+        args.Add("-ss");
+        args.Add(startSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    if (hwType.Equals("Nvidia", StringComparison.OrdinalIgnoreCase))
+    {
+        args.AddRange(new[] { "-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", src });
+        args.AddRange(new[] { "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-b:v", "5M" });
+    }
+    else if (hwType.Equals("Amd", StringComparison.OrdinalIgnoreCase))
+    {
+        args.AddRange(new[] { "-hwaccel", "dxva2", "-i", src });
+        args.AddRange(new[] { "-c:v", "h264_amf", "-b:v", "5M", "-profile:v", "high", "-level", "4.1" });
+    }
+    else
+    {
+        args.AddRange(new[] { "-i", src });
+        args.AddRange(new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-tune", "zerolatency" });
+    }
+
+    args.Add("-pix_fmt"); args.Add("yuv420p");
+
+    if (audioCodec == "aac")
+        args.AddRange(new[] { "-c:a", "copy" });
+    else
+        args.AddRange(new[] { "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000" });
+
+    // Shift output PTS so video.currentTime matches the original file's timeline
+    if (startSeconds > 0)
+    {
+        args.Add("-output_ts_offset");
+        args.Add(startSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture));
+    }
+
+    args.AddRange(new[]
+    {
+        "-map", "0:v:0", "-map", "0:a:0",
+        "-hls_time", hlsSegmentDuration.ToString(),
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", segPattern,
+        "-force_key_frames", $"expr:gte(t,n_forced*{hlsSegmentDuration})",
+        "-start_number", "0",
+        "-hls_list_size", "0",
+        "-hls_playlist_type", "event",
+        playlist
+    });
+
+    var psi = new ProcessStartInfo
+    {
+        FileName = "ffmpeg",
+        WorkingDirectory = outDir,
+        UseShellExecute = false,
+        RedirectStandardError = true,
+        RedirectStandardOutput = false,
+        CreateNoWindow = true
+    };
+    foreach (var a in args) psi.ArgumentList.Add(a);
+
+    jobPaths[key]     = outDir;
+    lastAccessUtc[key] = DateTime.UtcNow;
+
+    Console.WriteLine($"[HLS] ffmpeg queued: {key}\n  cmd: ffmpeg {string.Join(" ", args)}\n  outDir: {outDir}");
+
+    _ = Task.Run(async () =>
+    {
+        try { await registry.StartAsync(key, psi); }
+        catch (Exception ex) { Console.Error.WriteLine($"[HLS] Failed to start ffmpeg for {key}: {ex.Message}"); }
+    });
 }
 
 string GetAudioCodec(string inputFile)
@@ -578,44 +555,6 @@ string GetAudioCodec(string inputFile)
     return codec ?? "";
 }
 
-string GetVideoCodec(string inputFile)
-{
-    var psi = new ProcessStartInfo
-    {
-        FileName = "ffprobe",
-        RedirectStandardOutput = true,
-        UseShellExecute = false,
-        CreateNoWindow = true
-    };
-    psi.ArgumentList.Add("-v"); psi.ArgumentList.Add("quiet");
-    psi.ArgumentList.Add("-print_format"); psi.ArgumentList.Add("json");
-    psi.ArgumentList.Add("-show_streams"); psi.ArgumentList.Add("-select_streams"); psi.ArgumentList.Add("v:0");
-    psi.ArgumentList.Add(inputFile);
-
-    using var proc = Process.Start(psi);
-    string output = proc.StandardOutput.ReadToEnd();
-    proc.WaitForExit();
-
-    if (string.IsNullOrEmpty(output)) return "";
-    using var doc = JsonDocument.Parse(output);
-    if (!doc.RootElement.TryGetProperty("streams", out var streams) || streams.GetArrayLength() == 0)
-        return "";
-
-    var codec = streams[0].GetProperty("codec_name").GetString();
-
-    return codec ?? "";
-}
-
-string? GetVideoSubtitles(string inputFile)
-{
-    var subtitleSrt = Path.ChangeExtension(inputFile, ".srt");
-    var subtitleVtt = Path.ChangeExtension(inputFile, ".vtt");
-    string? subtitleFile = null;
-    if (File.Exists(subtitleVtt)) subtitleFile = subtitleVtt;
-    else if (File.Exists(subtitleSrt)) subtitleFile = subtitleSrt;
-
-    return subtitleFile;
-}
 
 List<(int index, string language, string title, string codec)> GetEmbeddedSubtitles(string inputFile)
 {
@@ -753,55 +692,120 @@ List<object> BuildMediaTree(string dir, string relBase)
 
 app.MapGet("/api/media", () => Results.Ok(BuildMediaTree(libraryRoot, "")));
 
-app.MapGet("/subs/{**path}", async (string path) =>
+app.MapGet("/subs/{**path}", async (HttpContext httpCtx, string path) =>
 {
     try
     {
         var src = SafeUnder(libraryRoot, path);
-        var basePath = Path.ChangeExtension(src, null); // remove extensão
 
-        // Procura legenda: .vtt tem prioridade, senão .srt
-        var vttPath = basePath + ".vtt";
-        var srtPath = basePath + ".srt";
-
-        // Se já existe .vtt, serve direto
-        if (File.Exists(vttPath))
-            return Results.File(vttPath, "text/vtt");
-
-        // Se existe .srt, converte para .vtt e faz cache
-        if (File.Exists(srtPath))
+        // ── Embedded subtitle extraction: /subs/video.mkv?track=N ────────────
+        if (httpCtx.Request.Query.TryGetValue("track", out var trackStr) &&
+            int.TryParse(trackStr, out var trackIndex))
         {
-            var psi = new ProcessStartInfo
+            // Get the codec type for this subtitle track
+            var subtitles = GetEmbeddedSubtitles(src);
+            var trackInfo = subtitles.FirstOrDefault(s => s.index == trackIndex);
+            
+            if (trackInfo == default)
             {
-                FileName = "ffmpeg",
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-            psi.ArgumentList.Add("-hide_banner");
-            psi.ArgumentList.Add("-y");
-            psi.ArgumentList.Add("-i");
-            psi.ArgumentList.Add(srtPath);
-            psi.ArgumentList.Add(vttPath);
+                Console.Error.WriteLine($"[SUBS] Track {trackIndex} not found in {src}");
+                return Results.NotFound();
+            }
 
-            using var proc = Process.Start(psi)!;
-            await proc.WaitForExitAsync();
+            Console.WriteLine($"[SUBS] Extracting embedded track {trackIndex}: codec={trackInfo.codec}, lang={trackInfo.language}");
 
-            if (proc.ExitCode == 0 && File.Exists(vttPath))
-                return Results.File(vttPath, "text/vtt");
+            var cacheVtt = Path.Combine(cacheRoot, "subs", $"{HashId($"{src}_s{trackIndex}")}.vtt");
+            Directory.CreateDirectory(Path.GetDirectoryName(cacheVtt)!);
 
-            return Results.StatusCode(500);
+            if (!File.Exists(cacheVtt))
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    UseShellExecute = false,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+                psi.ArgumentList.Add("-hide_banner"); psi.ArgumentList.Add("-y");
+                psi.ArgumentList.Add("-i");            psi.ArgumentList.Add(src);
+                psi.ArgumentList.Add("-map");          psi.ArgumentList.Add($"0:s:{trackIndex}");
+                
+                // For simple formats, output as-is. For complex formats, convert to WebVTT
+                if (trackInfo.codec.Equals("subrip", StringComparison.OrdinalIgnoreCase))
+                {
+                    // SRT → SRT (no conversion needed)
+                    psi.ArgumentList.Add("-c:s");          psi.ArgumentList.Add("copy");
+                    var cacheSrt = Path.ChangeExtension(cacheVtt, ".srt");
+                    psi.ArgumentList.Add(cacheSrt);
+                    
+                    using var proc = Process.Start(psi)!;
+                    await proc.WaitForExitAsync();
+
+                    if (proc.ExitCode != 0 || !File.Exists(cacheSrt))
+                    {
+                        Console.Error.WriteLine($"[SUBS] Failed to extract SRT track {trackIndex} from {src}");
+                        return Results.StatusCode(500);
+                    }
+                    Console.WriteLine($"[SUBS] Serving SRT track {trackIndex} (no conversion)");
+                    return Results.File(cacheSrt, "text/plain"); // SRT format
+                }
+                else
+                {
+                    // Complex formats (ASS/SSA/etc) → WebVTT
+                    if (trackInfo.codec.Equals("ass", StringComparison.OrdinalIgnoreCase) ||
+                        trackInfo.codec.Equals("ssa", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.WriteLine($"[SUBS] WARNING: {trackInfo.codec.ToUpper()} subtitles with styling will lose formatting in WebVTT conversion");
+                    }
+                    
+                    psi.ArgumentList.Add("-c:s");          psi.ArgumentList.Add("webvtt");
+                    psi.ArgumentList.Add(cacheVtt);
+                    
+                    using var proc = Process.Start(psi)!;
+                    var stderr = proc.StandardError.ReadToEnd();
+                    await proc.WaitForExitAsync();
+
+                    if (proc.ExitCode != 0 || !File.Exists(cacheVtt))
+                    {
+                        Console.Error.WriteLine($"[SUBS] Failed to convert {trackInfo.codec} track {trackIndex}: {stderr}");
+                        return Results.StatusCode(500);
+                    }
+                    Console.WriteLine($"[SUBS] Converted {trackInfo.codec} track {trackIndex} to WebVTT");
+                }
+            }
+
+            return Results.File(cacheVtt, "text/vtt");
         }
 
+        // ── External subtitle file (.vtt or .srt next to the video) ──────────
+        var basePath = Path.ChangeExtension(src, null);
+        var vttPath  = basePath + ".vtt";
+        var srtPath  = basePath + ".srt";
+
+        if (File.Exists(vttPath))
+        {
+            Console.WriteLine($"[SUBS] Serving external VTT: {vttPath}");
+            return Results.File(vttPath, "text/vtt");
+        }
+
+        if (File.Exists(srtPath))
+        {
+            // Try serving SRT directly (most browsers support it)
+            Console.WriteLine($"[SUBS] Serving external SRT: {srtPath}");
+            return Results.File(srtPath, "text/plain"); // SRT format - browsers treat as subtitles via <track>
+        }
+
+        Console.WriteLine($"[SUBS] No subtitle file found for {path}");
         return Results.NotFound();
     }
     catch (UnauthorizedAccessException)
     {
+        Console.Error.WriteLine("[SUBS] Unauthorized access");
         return Results.BadRequest();
     }
     catch (Exception ex)
     {
-        Console.WriteLine("[SUBS] Exception: " + ex);
+        Console.Error.WriteLine($"[SUBS] Exception: {ex.Message}\n{ex.StackTrace}");
         return Results.StatusCode(500);
     }
 });

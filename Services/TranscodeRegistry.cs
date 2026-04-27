@@ -40,6 +40,9 @@ namespace FlameStreamBackend.Services
             return p;
         }
 
+        public bool IsRunning(string key) =>
+            _procs.TryGetValue(key, out var p) && p != null && !p.HasExited;
+
         public void Stop(string key)
         {
             if (_procs.TryRemove(key, out var p))
