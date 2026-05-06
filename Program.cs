@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using FlameStreamBackend.Services;
 using Microsoft.AspNetCore.StaticFiles;
@@ -790,9 +791,9 @@ app.MapGet("/subs/{**path}", async (HttpContext httpCtx, string path) =>
 
         if (File.Exists(srtPath))
         {
-            // Try serving SRT directly (most browsers support it)
-            Console.WriteLine($"[SUBS] Serving external SRT: {srtPath}");
-            return Results.File(srtPath, "text/plain"); // SRT format - browsers treat as subtitles via <track>
+            Console.WriteLine($"[SUBS] Converting external SRT to VTT: {srtPath}");
+            var vttContent = ConvertSrtToVtt(await ReadTextWithFallback(srtPath));
+            return Results.Content(vttContent, "text/vtt; charset=utf-8");
         }
 
         Console.WriteLine($"[SUBS] No subtitle file found for {path}");
@@ -811,3 +812,52 @@ app.MapGet("/subs/{**path}", async (HttpContext httpCtx, string path) =>
 });
 
 app.Run();
+
+// ── Subtitle helpers ──────────────────────────────────────────────────────────
+
+static async Task<string> ReadTextWithFallback(string path)
+{
+    // Try UTF-8 first (strict). If it contains invalid sequences, fall back to
+    // Windows-1252 (covers accented characters common in Portuguese SRT files).
+    var utf8Strict = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+    try
+    {
+        return await File.ReadAllTextAsync(path, utf8Strict);
+    }
+    catch (DecoderFallbackException)
+    {
+        return await File.ReadAllTextAsync(path, Encoding.Latin1);
+    }
+}
+
+static string ConvertSrtToVtt(string srt)
+{
+    // Normalise line endings
+    srt = srt.Replace("\r\n", "\n").Replace("\r", "\n");
+
+    var sb = new StringBuilder();
+    sb.Append("WEBVTT\n\n");
+
+    foreach (var block in srt.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+    {
+        var lines = block.Trim().Split('\n');
+        if (lines.Length < 2) continue;
+
+        // Skip optional cue-index line (bare integer)
+        int i = int.TryParse(lines[0].Trim(), out _) ? 1 : 0;
+        if (i >= lines.Length) continue;
+
+        // Timestamp line must contain "-->"
+        if (!lines[i].Contains("-->")) continue;
+
+        // SRT uses comma as decimal separator; VTT requires a period
+        sb.Append(lines[i].Replace(',', '.')).Append('\n');
+
+        for (int j = i + 1; j < lines.Length; j++)
+            sb.Append(lines[j]).Append('\n');
+
+        sb.Append('\n');
+    }
+
+    return sb.ToString();
+}
