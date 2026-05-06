@@ -1,7 +1,11 @@
+using System.Text;
 using FlameStreamBackend;
 using FlameStreamBackend.Helpers;
 using FlameStreamBackend.Services;
 using Microsoft.AspNetCore.StaticFiles;
+
+// Required for Encoding.GetEncoding(1252) to work on Linux/Docker
+Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
 var builder = WebApplication.CreateBuilder(args);
 var serverConfig = builder.Configuration.GetSection("Server");

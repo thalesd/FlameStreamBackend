@@ -116,8 +116,10 @@ public class SubtitleService
 
     private static async Task<string> ReadTextWithFallback(string path)
     {
-        // Try UTF-8 first (strict). If bytes are invalid, fall back to Latin-1
-        // (covers Windows-1252 encoding common in Portuguese SRT files).
+        // Try UTF-8 first (strict, so invalid sequences throw immediately).
+        // Fall back to Windows-1252 (CP1252), NOT Latin-1: bytes 0x80-0x9F are
+        // printable in CP1252 (en-dash, curly quotes, etc.) but control characters
+        // in Latin-1, which causes them to render as squares in the browser.
         var utf8Strict = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
         try
         {
@@ -125,7 +127,7 @@ public class SubtitleService
         }
         catch (DecoderFallbackException)
         {
-            return await File.ReadAllTextAsync(path, Encoding.Latin1);
+            return await File.ReadAllTextAsync(path, Encoding.GetEncoding(1252));
         }
     }
 
