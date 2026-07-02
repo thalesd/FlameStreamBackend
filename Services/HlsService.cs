@@ -49,6 +49,43 @@ public class HlsService
         catch { return false; }
     }
 
+    /// <summary>
+    /// Finds the segment index whose time range contains <paramref name="timeSeconds"/> by
+    /// summing the playlist's own EXTINF durations, and whether the encoded segments reach
+    /// that time. Reading segment length from the playlist (instead of assuming the current
+    /// <c>HlsSegmentSeconds</c>) is essential: a title cached under a different segment length
+    /// — e.g. an older 10s cache while the config is now 4s — would otherwise have its seek
+    /// index miscomputed as <c>floor(t / 4)</c>, making an already-complete main look like it
+    /// hasn't reached the seek point and spuriously spinning up a redundant seek transcode.
+    /// </summary>
+    public (int index, bool covered) LocateSegment(string playlistPath, double timeSeconds)
+    {
+        if (!File.Exists(playlistPath)) return (0, false);
+        var lines = File.ReadAllLines(playlistPath);
+        double cumulative = 0;
+        int index = 0;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var line = lines[i].Trim();
+            if (!line.StartsWith("#EXTINF:", StringComparison.Ordinal)) continue;
+            if (i + 1 >= lines.Length || !lines[i + 1].Trim().EndsWith(".ts", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var durText = line["#EXTINF:".Length..];
+            var comma = durText.IndexOf(',');
+            if (comma >= 0) durText = durText[..comma];
+            double.TryParse(durText, System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var dur);
+
+            if (timeSeconds < cumulative + dur - 1e-6)
+                return (index, true); // this already-encoded segment contains the requested time
+            cumulative += dur;
+            index++;
+            i++; // skip the segment filename line paired with this EXTINF
+        }
+        // Requested time is at or beyond the end of everything encoded so far.
+        return (Math.Max(0, index - 1), false);
+    }
+
     public string BuildSubPlaylist(string playlistPath, string urlBase, int startSegment, int? mediaSequenceOverride = null)
     {
         var lines = File.ReadAllLines(playlistPath);
@@ -294,11 +331,16 @@ public class HlsService
             await decisionGate.WaitAsync();
             try
             {
-                if (CountEncodedSegments(mainPlaylist) > startSegment)
+                var (mainIndex, mainCovered) = LocateSegment(mainPlaylist, startSeconds);
+                if (mainCovered)
                 {
                     hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
                     useOriginalForSeek = true;
-                    Console.WriteLine($"[HLS] Main has segment {startSegment}, serving from main stream");
+                    // Serve from the segment the main playlist's own timing says contains this
+                    // moment, not floor(startSeconds / config): the two differ whenever the cache
+                    // was encoded at a different segment length than the current config.
+                    startSegment = mainIndex;
+                    Console.WriteLine($"[HLS] Main covers {startSeconds}s at segment {startSegment}, serving from main stream");
 
                     if (_activeSeekJobs.TryRemove(baseHash, out var obsoleteSeekHash))
                     {
