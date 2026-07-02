@@ -31,6 +31,7 @@ builder.Services.AddSingleton<FFprobeService>();
 builder.Services.AddSingleton<HlsService>();
 builder.Services.AddSingleton<MediaLibraryService>();
 builder.Services.AddSingleton<SubtitleService>();
+builder.Services.AddSingleton<WatchHistoryService>();
 builder.Services.AddHostedService<IdleCleanupService>();
 
 var app = builder.Build();
@@ -38,12 +39,17 @@ var app = builder.Build();
 Directory.CreateDirectory(settings.LibraryRoot);
 Directory.CreateDirectory(settings.CacheRoot);
 
+await app.Services.GetRequiredService<WatchHistoryService>().EnsureSchemaAsync();
+
 AppDomain.CurrentDomain.ProcessExit += (_, __) => registry.StopAll();
 
 if (app.Environment.IsDevelopment())
     app.MapOpenApi();
 
 app.UseCors();
+
+// Serves wwwroot/ — includes receiver.html for the Chromecast Custom Receiver
+app.UseStaticFiles();
 
 var hlsContentTypes = new FileExtensionContentTypeProvider();
 hlsContentTypes.Mappings[".m3u8"] = "application/vnd.apple.mpegurl";
@@ -122,4 +128,46 @@ app.MapGet("/api/media", (MediaLibraryService lib) =>
 app.MapGet("/subs/{**path}", async (HttpContext ctx, string path, SubtitleService subs) =>
     await subs.GetSubtitlesAsync(ctx, path));
 
+app.MapPost("/api/preprocess", async (string path, HlsService hls) =>
+{
+    try
+    {
+        var src = PathHelper.SafeUnder(settings.LibraryRoot, path);
+        if (!File.Exists(src)) return Results.NotFound();
+        var started = await hls.EnsurePreprocessAsync(src);
+        return Results.Ok(new { started });
+    }
+    catch (UnauthorizedAccessException) { return Results.BadRequest(); }
+});
+
+app.MapGet("/api/jobs", (HlsService hls) => Results.Ok(hls.GetActiveJobs()));
+
+app.MapPost("/api/jobs/{key}/cancel", (string key, HlsService hls) =>
+    Results.Ok(new { cancelled = hls.CancelJob(key) }));
+
+app.MapGet("/api/watch-history/{**path}", async (string path, WatchHistoryService history) =>
+    Results.Ok(await history.GetAsync(path)));
+
+app.MapPost("/api/watch-history", async (WatchHistoryRequest body, WatchHistoryService history) =>
+{
+    await history.UpsertAsync(body.Path, body.PositionSeconds, body.DurationSeconds);
+    return Results.Ok();
+});
+
+app.MapGet("/api/continue-watching", async (WatchHistoryService history) =>
+    Results.Ok(await history.GetContinueWatchingAsync()));
+
+app.MapPost("/api/cache/delete", (string path, HlsService hls) =>
+{
+    try
+    {
+        var src = PathHelper.SafeUnder(settings.LibraryRoot, path);
+        hls.DeleteCache(src);
+        return Results.Ok();
+    }
+    catch (UnauthorizedAccessException) { return Results.BadRequest(); }
+});
+
 app.Run();
+
+record WatchHistoryRequest(string Path, double PositionSeconds, double DurationSeconds);

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
 using FlameStreamBackend.Helpers;
 
 namespace FlameStreamBackend.Services;
@@ -105,9 +106,17 @@ public class SubtitleService
         var srtPath = basePath + ".srt";
         if (File.Exists(srtPath))
         {
-            Console.WriteLine($"[SUBS] Converting external SRT to VTT: {srtPath}");
-            var vttContent = ConvertSrtToVtt(await ReadTextWithFallback(srtPath));
-            return Results.Content(vttContent, "text/vtt; charset=utf-8");
+            var cacheVtt = Path.Combine(_cacheRoot, "subs", $"{PathHelper.HashId(srtPath)}.vtt");
+            Directory.CreateDirectory(Path.GetDirectoryName(cacheVtt)!);
+
+            if (!File.Exists(cacheVtt) || File.GetLastWriteTimeUtc(srtPath) > File.GetLastWriteTimeUtc(cacheVtt))
+            {
+                Console.WriteLine($"[SUBS] Converting external SRT to VTT: {srtPath}");
+                var vttContent = ConvertSrtToVtt(await ReadTextWithFallback(srtPath));
+                await File.WriteAllTextAsync(cacheVtt, vttContent, new UTF8Encoding(false));
+            }
+
+            return Results.File(cacheVtt, "text/vtt");
         }
 
         Console.WriteLine($"[SUBS] No subtitle file found for {path}");
@@ -131,27 +140,69 @@ public class SubtitleService
         }
     }
 
+    // Matches an SRT/VTT timing line anywhere, regardless of surrounding blank-line count
+    // or a missing/garbled cue-index line — the previous parser relied on both of those
+    // being well-formed and silently dropped the whole cue otherwise.
+    private static readonly Regex TimingRegex = new(
+        @"^\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{3})",
+        RegexOptions.Compiled);
+
+    private const char Bom = '﻿';
+
     private static string ConvertSrtToVtt(string srt)
     {
-        srt = srt.Replace("\r\n", "\n").Replace("\r", "\n");
+        srt = srt.Replace("\r\n", "\n").Replace("\r", "\n").TrimStart(Bom);
+        var lines = srt.Split('\n');
+
+        var anchors = new List<(int line, Match match)>();
+        for (int i = 0; i < lines.Length; i++)
+        {
+            var m = TimingRegex.Match(lines[i]);
+            if (m.Success) anchors.Add((i, m));
+        }
+
         var sb = new StringBuilder();
         sb.Append("WEBVTT\n\n");
 
-        foreach (var block in srt.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        int cuesEmitted = 0, emptyCues = 0;
+        for (int a = 0; a < anchors.Count; a++)
         {
-            var lines = block.Trim().Split('\n');
-            if (lines.Length < 2) continue;
+            var (timingLine, match) = anchors[a];
+            int textStart = timingLine + 1;
+            int textEnd = (a + 1 < anchors.Count ? anchors[a + 1].line : lines.Length) - 1;
 
-            int i = int.TryParse(lines[0].Trim(), out _) ? 1 : 0;
-            if (i >= lines.Length || !lines[i].Contains("-->")) continue;
+            while (textEnd >= textStart && string.IsNullOrWhiteSpace(lines[textEnd]))
+                textEnd--;
 
-            // SRT uses comma as millisecond separator; VTT requires a period
-            sb.Append(lines[i].Replace(',', '.')).Append('\n');
-            for (int j = i + 1; j < lines.Length; j++)
+            // The line right before the next cue's timing line is normally that next
+            // cue's index number (not part of this cue's text) — drop it if so.
+            if (a + 1 < anchors.Count && textEnd >= textStart && int.TryParse(lines[textEnd].Trim(), out _))
+            {
+                textEnd--;
+                while (textEnd >= textStart && string.IsNullOrWhiteSpace(lines[textEnd]))
+                    textEnd--;
+            }
+
+            var timing = $"{match.Groups[1].Value.Replace(',', '.')} --> {match.Groups[2].Value.Replace(',', '.')}";
+
+            if (textEnd < textStart)
+            {
+                Console.Error.WriteLine($"[SUBS] Empty cue at {timing}");
+                emptyCues++;
+                continue;
+            }
+
+            sb.Append(timing).Append('\n');
+            for (int j = textStart; j <= textEnd; j++)
+            {
+                if (string.IsNullOrWhiteSpace(lines[j])) continue;
                 sb.Append(lines[j]).Append('\n');
+            }
             sb.Append('\n');
+            cuesEmitted++;
         }
 
+        Console.WriteLine($"[SUBS] SRT->VTT conversion: {cuesEmitted} cues converted, {emptyCues} empty/skipped");
         return sb.ToString();
     }
 }
