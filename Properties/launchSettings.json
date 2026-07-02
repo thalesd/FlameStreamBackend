@@ -5,16 +5,14 @@
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
-      "dotnetRunMessages": true,
-      "applicationUrl": "https://192.168.0.50:5001;http://192.168.0.50:5000"
+      "dotnetRunMessages": true
     },
     "https": {
       "commandName": "Project",
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
-      "dotnetRunMessages": true,
-      "applicationUrl": "https://192.168.0.50:5001;http://192.168.0.50:5000"
+      "dotnetRunMessages": true
     },
     "Container (Dockerfile)": {
       "commandName": "Docker",
@@ -30,8 +28,7 @@
       "commandName": "WSL2",
       "launchUrl": "https://192.168.0.50:5001",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Development",
-        "ASPNETCORE_URLS": "https://192.168.0.50:5001;http://192.168.0.50:5000"
+        "ASPNETCORE_ENVIRONMENT": "Development"
       },
       "distributionName": ""
     }

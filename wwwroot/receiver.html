@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <title>FlameStream</title>
+  <!--
+    Google Cast Application Framework (CAF) Receiver SDK.
+    <cast-media-player> is a built-in custom element that:
+      - Plays HLS and MP4 streams via Shaka Player
+      - Renders VTT subtitle tracks
+      - Shows a full controls overlay on the TV (seek bar, time, title, CC button)
+      - Receives all commands from the sender app (play/pause/seek/volume/tracks)
+  -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <!-- Custom seek/offset handling — see receiver.js. Calls context.start() itself. -->
+  <script src="receiver.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0b0e14;
+      overflow: hidden;
+      font-family: 'DM Sans', system-ui, sans-serif;
+    }
+
+    /* CAF CSS custom properties for <cast-media-player> */
+    cast-media-player {
+      --theme-hue: 215;                          /* blue accent hue */
+      --progress-color:  #3d8bff;                /* seek bar fill */
+      --buffered-color:  rgba(61,139,255,.3);     /* buffered region */
+      --background-color: #0b0e14;               /* letterbox / splash bg */
+      --font-family: 'DM Sans', system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+</body>
+</html>

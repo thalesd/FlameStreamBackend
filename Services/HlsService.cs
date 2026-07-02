@@ -5,6 +5,8 @@ using FlameStreamBackend.Helpers;
 
 namespace FlameStreamBackend.Services;
 
+public sealed record JobStatusDto(string Key, string Path, string JobType, double StartSeconds, double PercentComplete, double ElapsedSeconds);
+
 public class HlsService
 {
     private readonly TranscodeRegistry _registry;
@@ -14,6 +16,10 @@ public class HlsService
     internal readonly ConcurrentDictionary<string, DateTime> LastAccess = new();
     private readonly ConcurrentDictionary<string, string> _activeSeekJobs = new();
     private readonly ConcurrentDictionary<string, string> _jobPaths = new();
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _jobLocks = new();
+
+    private sealed record JobMeta(string RelPath, string OutDir, bool IsMain, double StartSeconds, double DurationSeconds, DateTime StartedAt);
+    private readonly ConcurrentDictionary<string, JobMeta> _jobMeta = new();
 
     public HlsService(TranscodeRegistry registry, FFprobeService ffprobe, ServerSettings settings)
     {
@@ -23,6 +29,8 @@ public class HlsService
     }
 
     public void TouchJob(string key) => LastAccess[key] = DateTime.UtcNow;
+
+    private SemaphoreSlim GetLock(string key) => _jobLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
 
     public string MainDir(string baseHash) => Path.Combine(_settings.CacheRoot, baseHash);
     public string TempDir(string baseHash, string seekHash) => Path.Combine(_settings.CacheRoot, baseHash, "temp", seekHash);
@@ -90,6 +98,8 @@ public class HlsService
         _registry.Stop(seekHash);
         LastAccess.TryRemove(seekHash, out _);
         _jobPaths.TryRemove(seekHash, out _);
+        _jobMeta.TryRemove(seekHash, out _);
+        _jobLocks.TryRemove(seekHash, out _);
         var dir = TempDir(baseHash, seekHash);
         if (!Directory.Exists(dir)) return;
         if (!IsPlaylistComplete(Path.Combine(dir, "stream.m3u8")))
@@ -170,6 +180,10 @@ public class HlsService
         _jobPaths[key]  = outDir;
         LastAccess[key] = DateTime.UtcNow;
 
+        var (duration, _, _) = _ffprobe.GetMediaInfo(src);
+        var relPath = Path.GetRelativePath(_settings.LibraryRoot, src).Replace('\\', '/');
+        _jobMeta[key] = new JobMeta(relPath, outDir, startSeconds <= 0, startSeconds, duration, DateTime.UtcNow);
+
         Console.WriteLine($"[HLS] ffmpeg queued: {key}\n  cmd: ffmpeg {string.Join(" ", args)}\n  outDir: {outDir}");
 
         _ = Task.Run(async () =>
@@ -179,17 +193,94 @@ public class HlsService
         });
     }
 
+    /// <summary>Atomically starts a job for <paramref name="key"/> if it isn't already complete or running. Returns whether it started one.</summary>
+    private async Task<bool> EnsureJobStartedAsync(string key, string outDir, string src, double startSeconds)
+    {
+        var playlist = Path.Combine(outDir, "stream.m3u8");
+        if (IsPlaylistComplete(playlist) || _registry.IsRunning(key)) return false;
+
+        var gate = GetLock(key);
+        await gate.WaitAsync();
+        try
+        {
+            if (IsPlaylistComplete(playlist) || _registry.IsRunning(key)) return false;
+            StartFfmpegJob(key, outDir, src, startSeconds);
+            return true;
+        }
+        finally { gate.Release(); }
+    }
+
+    /// <summary>Kicks off (or confirms already-running) the main from-zero transcode for a title, without opening the player.</summary>
+    public Task<bool> EnsurePreprocessAsync(string src)
+    {
+        var baseHash = PathHelper.HashId(src);
+        return EnsureJobStartedAsync(baseHash, MainDir(baseHash), src, 0.0);
+    }
+
+    public IReadOnlyList<JobStatusDto> GetActiveJobs()
+    {
+        var result = new List<JobStatusDto>();
+        foreach (var (key, meta) in _jobMeta)
+        {
+            if (!_registry.IsRunning(key)) continue;
+            var playlist = Path.Combine(meta.OutDir, "stream.m3u8");
+            var percent = meta.DurationSeconds > 0
+                ? Math.Clamp(CountEncodedSegments(playlist) * _settings.HlsSegmentSeconds / meta.DurationSeconds * 100.0, 0, 100)
+                : 0;
+            result.Add(new JobStatusDto(key, meta.RelPath, meta.IsMain ? "main" : "seek", meta.StartSeconds, percent, (DateTime.UtcNow - meta.StartedAt).TotalSeconds));
+        }
+        return result;
+    }
+
+    /// <summary>Stops a job (main or seek) by key and clears its bookkeeping. Returns whether it was actually running.</summary>
+    public bool CancelJob(string key)
+    {
+        var wasRunning = _registry.IsRunning(key);
+        _registry.Stop(key);
+        _jobMeta.TryRemove(key, out _);
+        _jobLocks.TryRemove(key, out _);
+        foreach (var kv in _activeSeekJobs)
+            if (kv.Value == key) _activeSeekJobs.TryRemove(kv.Key, out _);
+        return wasRunning;
+    }
+
+    /// <summary>Deletes a title's entire cache dir (main + any seek temp dirs) to reclaim disk space, stopping any running jobs first. Unlike idle cleanup, this deletes regardless of completion state since it's an explicit user action.</summary>
+    public void DeleteCache(string src)
+    {
+        var baseHash = PathHelper.HashId(src);
+
+        CancelJob(baseHash);
+        if (_activeSeekJobs.TryRemove(baseHash, out var seekHash))
+            CancelJob(seekHash);
+
+        var dir = MainDir(baseHash);
+        if (Directory.Exists(dir))
+        {
+            try { Directory.Delete(dir, true); }
+            catch (Exception ex) { Console.Error.WriteLine($"[Cache] Failed to delete cache {baseHash}: {ex.Message}"); }
+        }
+    }
+
+    public long GetCacheSizeBytes(string src)
+    {
+        var dir = MainDir(PathHelper.HashId(src));
+        if (!Directory.Exists(dir)) return 0;
+        long total = 0;
+        foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+        {
+            try { total += new FileInfo(f).Length; } catch { /* file may vanish mid-enumeration */ }
+        }
+        return total;
+    }
+
     public async Task<IResult> HandleStreamRequestAsync(HttpContext ctx, string src, double startSeconds)
     {
         var baseHash     = PathHelper.HashId(src);
         var mainDir      = MainDir(baseHash);
         var mainPlaylist = Path.Combine(mainDir, "stream.m3u8");
 
-        if (!IsPlaylistComplete(mainPlaylist) && !_registry.IsRunning(baseHash))
-        {
+        if (await EnsureJobStartedAsync(baseHash, mainDir, src, 0.0))
             Console.WriteLine($"[HLS] Starting main encoding for {baseHash}");
-            StartFfmpegJob(baseHash, mainDir, src, 0.0);
-        }
 
         var startSegment = (int)Math.Floor(startSeconds / _settings.HlsSegmentSeconds);
         string hash, outDir, urlBase;
@@ -197,33 +288,41 @@ public class HlsService
 
         if (startSeconds > 0)
         {
-            if (CountEncodedSegments(mainPlaylist) > startSegment)
+            // Serialized per-title so concurrent requests (e.g. web + Cast) can't both
+            // read a stale "active seek job" and double-tear-down/replace it.
+            var decisionGate = GetLock(baseHash);
+            await decisionGate.WaitAsync();
+            try
             {
-                hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
-                useOriginalForSeek = true;
-                Console.WriteLine($"[HLS] Main has segment {startSegment}, serving from main stream");
-
-                if (_activeSeekJobs.TryRemove(baseHash, out var obsoleteSeekHash))
+                if (CountEncodedSegments(mainPlaylist) > startSegment)
                 {
-                    Console.WriteLine($"[HLS] Cleaning up seek job {obsoleteSeekHash} (main caught up)");
-                    CleanupSeekJob(baseHash, obsoleteSeekHash);
+                    hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
+                    useOriginalForSeek = true;
+                    Console.WriteLine($"[HLS] Main has segment {startSegment}, serving from main stream");
+
+                    if (_activeSeekJobs.TryRemove(baseHash, out var obsoleteSeekHash))
+                    {
+                        Console.WriteLine($"[HLS] Cleaning up seek job {obsoleteSeekHash} (main caught up)");
+                        CleanupSeekJob(baseHash, obsoleteSeekHash);
+                    }
+                }
+                else
+                {
+                    var seekHash = PathHelper.HashId($"{src}_{startSeconds}");
+                    hash = seekHash; outDir = TempDir(baseHash, seekHash); urlBase = $"/hls/{baseHash}/temp/{seekHash}";
+                    useOriginalForSeek = false;
+                    Console.WriteLine($"[HLS] Main doesn't have segment {startSegment} yet, using seek job {seekHash}");
+
+                    if (_activeSeekJobs.TryGetValue(baseHash, out var prevSeekHash) && prevSeekHash != seekHash)
+                    {
+                        Console.WriteLine($"[HLS] New seek position — stopping previous seek job {prevSeekHash}");
+                        _activeSeekJobs.TryRemove(baseHash, out _);
+                        CleanupSeekJob(baseHash, prevSeekHash);
+                    }
+                    _activeSeekJobs[baseHash] = seekHash;
                 }
             }
-            else
-            {
-                var seekHash = PathHelper.HashId($"{src}_{startSeconds}");
-                hash = seekHash; outDir = TempDir(baseHash, seekHash); urlBase = $"/hls/{baseHash}/temp/{seekHash}";
-                useOriginalForSeek = false;
-                Console.WriteLine($"[HLS] Main doesn't have segment {startSegment} yet, using seek job {seekHash}");
-
-                if (_activeSeekJobs.TryGetValue(baseHash, out var prevSeekHash) && prevSeekHash != seekHash)
-                {
-                    Console.WriteLine($"[HLS] New seek position — stopping previous seek job {prevSeekHash}");
-                    _activeSeekJobs.TryRemove(baseHash, out _);
-                    CleanupSeekJob(baseHash, prevSeekHash);
-                }
-                _activeSeekJobs[baseHash] = seekHash;
-            }
+            finally { decisionGate.Release(); }
         }
         else
         {
@@ -239,7 +338,7 @@ public class HlsService
             if (startSeconds > 0 && !useOriginalForSeek)
             {
                 Console.WriteLine($"[HLS] Starting seek encoding from {startSeconds}s");
-                StartFfmpegJob(hash, outDir, src, startSeconds);
+                await EnsureJobStartedAsync(hash, outDir, src, startSeconds);
             }
 
             var sw = Stopwatch.StartNew();
@@ -312,6 +411,8 @@ public class HlsService
             _registry.Stop(kv.Key);
             LastAccess.TryRemove(kv.Key, out _);
             _jobPaths.TryRemove(kv.Key, out var cacheDir);
+            _jobMeta.TryRemove(kv.Key, out _);
+            _jobLocks.TryRemove(kv.Key, out _);
             cacheDir ??= Path.Combine(_settings.CacheRoot, kv.Key);
 
             try
