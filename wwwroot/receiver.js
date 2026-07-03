@@ -28,9 +28,11 @@
   const stateBadge = document.getElementById('state-badge');
 
   // ── Debug overlay + backend log relay ───────────────────────────────────────
-  // Set DEBUG = false for normal viewing. dlog() lines go to: console, the compact
-  // on-TV overlay, and POST /api/castlog (readable from any machine on the LAN).
-  const DEBUG = true;
+  // DEBUG toggles ONLY the on-TV overlay. dlog() always goes to the console and to
+  // POST /api/castlog (LAN-readable ring buffer) — that relay is how this receiver
+  // gets debugged at all (the TV's remote-DevTools port is unreachable), so it stays
+  // on even for normal viewing; it's a handful of tiny same-origin requests.
+  const DEBUG = false;
   let logEl = null;
   const logLines = [];
   function renderLog() {
@@ -47,11 +49,11 @@
   }
   function dlog(msg) {
     console.log('[FlameStream receiver] ' + msg);
+    try { fetch('/api/castlog', { method: 'POST', body: msg }); } catch (e) {}
     if (!DEBUG) return;
     logLines.push(msg);
     while (logLines.length > 14) logLines.shift();
     renderLog();
-    try { fetch('/api/castlog', { method: 'POST', body: msg }); } catch (e) {}
   }
   window.addEventListener('error', (e) => dlog('JS ERROR: ' + (e.message || '?') + ' @' + (e.filename || '?') + ':' + (e.lineno || '?')));
   window.addEventListener('unhandledrejection', (e) => {
@@ -171,6 +173,53 @@
     hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
   }
 
+  // Seek to an absolute (original-file) time. Direct files seek natively anywhere;
+  // HLS reloads when outside the buffer so the backend can start a seek transcode
+  // if needed (mirrors the web app's seek()/reloadFrom()).
+  function doSeek(target) {
+    if (typeof target !== 'number' || isNaN(target) || !currentUrl) return;
+    target = Math.max(0, totalDuration > 0 ? Math.min(target, totalDuration - 2) : target);
+    const local = target - startOffset;
+    let buffered = false;
+    for (let i = 0; i < video.buffered.length; i++) {
+      if (local >= video.buffered.start(i) - 1 && local <= video.buffered.end(i)) { buffered = true; break; }
+    }
+    if (buffered || currentUrl.indexOf('.m3u8') === -1) {
+      video.currentTime = currentUrl.indexOf('.m3u8') === -1 ? target : local;
+    } else {
+      loadAt(target);
+    }
+    sendStatus();
+  }
+
+  function togglePlay() {
+    if (video.paused) video.play().catch(() => {}); else video.pause();
+  }
+
+  // ── TV remote (empirical) ───────────────────────────────────────────────────
+  // Remote keys normally reach a receiver through the CAF media session — the exact
+  // component that's broken on this TV — so that route is closed. Some Chromecast
+  // built-in runtimes ALSO deliver remote presses as DOM key events to the page;
+  // whether this TV does is unknown, so every key is logged to the castlog (the
+  // verdict) and the plausible media keys are wired up in case they do arrive.
+  window.addEventListener('keydown', (e) => {
+    dlog('remote key: "' + e.key + '" code=' + e.keyCode);
+    switch (e.key) {
+      case ' ':
+      case 'Enter':
+      case 'MediaPlayPause': togglePlay(); break;
+      case 'MediaPlay':      video.play().catch(() => {}); break;
+      case 'MediaPause':     video.pause(); break;
+      case 'MediaStop':      video.pause(); break;
+      case 'ArrowRight':
+      case 'MediaFastForward':
+      case 'MediaTrackNext': doSeek(video.currentTime + startOffset + 10); break;
+      case 'ArrowLeft':
+      case 'MediaRewind':
+      case 'MediaTrackPrevious': doSeek(video.currentTime + startOffset - 10); break;
+    }
+  });
+
   // ── Message handling ────────────────────────────────────────────────────────
   function sendStatus() {
     try {
@@ -208,23 +257,9 @@
         video.pause();
         break;
 
-      case 'seek': {
-        const target = m.time;
-        const local = target - startOffset;
-        let buffered = false;
-        for (let i = 0; i < video.buffered.length; i++) {
-          if (local >= video.buffered.start(i) - 1 && local <= video.buffered.end(i)) { buffered = true; break; }
-        }
-        // Direct files seek natively anywhere; HLS reloads when outside the buffer
-        // so the backend can start a seek transcode if needed (mirrors the web app).
-        if (buffered || currentUrl.indexOf('.m3u8') === -1) {
-          video.currentTime = currentUrl.indexOf('.m3u8') === -1 ? target : local;
-        } else {
-          loadAt(target);
-        }
-        sendStatus();
+      case 'seek':
+        doSeek(m.time);
         break;
-      }
 
       case 'setVolume':
         video.volume = Math.max(0, Math.min(1, m.level));
@@ -263,7 +298,7 @@
 
   // ── Start ───────────────────────────────────────────────────────────────────
   context.addEventListener(cast.framework.system.EventType.READY, () => {
-    dlog('=== receiver build 2026-07-04b ready (self-driven hls.js playback) ===');
+    dlog('=== receiver build 2026-07-04c ready (self-driven hls.js playback) ===');
   });
   // No PlayerManager media session ever exists in this receiver, so the platform's
   // media-based idle timeout would kill the session mid-movie — disable it. The
