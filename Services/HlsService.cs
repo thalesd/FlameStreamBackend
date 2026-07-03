@@ -58,9 +58,9 @@ public class HlsService
     /// index miscomputed as <c>floor(t / 4)</c>, making an already-complete main look like it
     /// hasn't reached the seek point and spuriously spinning up a redundant seek transcode.
     /// </summary>
-    public (int index, bool covered) LocateSegment(string playlistPath, double timeSeconds)
+    public (int index, bool covered, double start) LocateSegment(string playlistPath, double timeSeconds)
     {
-        if (!File.Exists(playlistPath)) return (0, false);
+        if (!File.Exists(playlistPath)) return (0, false, 0);
         var lines = File.ReadAllLines(playlistPath);
         double cumulative = 0;
         int index = 0;
@@ -77,13 +77,13 @@ public class HlsService
                 System.Globalization.CultureInfo.InvariantCulture, out var dur);
 
             if (timeSeconds < cumulative + dur - 1e-6)
-                return (index, true); // this already-encoded segment contains the requested time
+                return (index, true, cumulative); // this encoded segment contains the requested time; it begins at `cumulative`
             cumulative += dur;
             index++;
             i++; // skip the segment filename line paired with this EXTINF
         }
         // Requested time is at or beyond the end of everything encoded so far.
-        return (Math.Max(0, index - 1), false);
+        return (Math.Max(0, index - 1), false, cumulative);
     }
 
     public string BuildSubPlaylist(string playlistPath, string urlBase, int startSegment, int? mediaSequenceOverride = null)
@@ -322,6 +322,12 @@ public class HlsService
         var startSegment = (int)Math.Floor(startSeconds / _settings.HlsSegmentSeconds);
         string hash, outDir, urlBase;
         bool useOriginalForSeek;
+        // Absolute time that this response's media-local time 0 corresponds to. The player
+        // resets currentTime to ~0 on every reload, so it needs this to align its clock and
+        // subtitle cue timing. It is NOT necessarily the requested startSeconds: when serving
+        // from the main stream we can only start at a segment boundary at or before the
+        // request, so the true origin is that segment's start — reported via X-Hls-Start-Offset.
+        double startOffset = 0;
 
         if (startSeconds > 0)
         {
@@ -331,7 +337,7 @@ public class HlsService
             await decisionGate.WaitAsync();
             try
             {
-                var (mainIndex, mainCovered) = LocateSegment(mainPlaylist, startSeconds);
+                var (mainIndex, mainCovered, mainStart) = LocateSegment(mainPlaylist, startSeconds);
                 if (mainCovered)
                 {
                     hash = baseHash; outDir = mainDir; urlBase = $"/hls/{baseHash}";
@@ -340,7 +346,10 @@ public class HlsService
                     // moment, not floor(startSeconds / config): the two differ whenever the cache
                     // was encoded at a different segment length than the current config.
                     startSegment = mainIndex;
-                    Console.WriteLine($"[HLS] Main covers {startSeconds}s at segment {startSegment}, serving from main stream");
+                    // The main segments keep their original timing, so local-0 is this segment's
+                    // start (<= startSeconds), not startSeconds itself.
+                    startOffset = mainStart;
+                    Console.WriteLine($"[HLS] Main covers {startSeconds}s at segment {startSegment} (start {mainStart:F3}s), serving from main stream");
 
                     if (_activeSeekJobs.TryRemove(baseHash, out var obsoleteSeekHash))
                     {
@@ -353,6 +362,9 @@ public class HlsService
                     var seekHash = PathHelper.HashId($"{src}_{startSeconds}");
                     hash = seekHash; outDir = TempDir(baseHash, seekHash); urlBase = $"/hls/{baseHash}/temp/{seekHash}";
                     useOriginalForSeek = false;
+                    // A seek job is encoded with -output_ts_offset startSeconds, so its media-local
+                    // 0 lands exactly at startSeconds.
+                    startOffset = startSeconds;
                     Console.WriteLine($"[HLS] Main doesn't have segment {startSegment} yet, using seek job {seekHash}");
 
                     if (_activeSeekJobs.TryGetValue(baseHash, out var prevSeekHash) && prevSeekHash != seekHash)
@@ -405,6 +417,7 @@ public class HlsService
                 Console.WriteLine($"[HLS] Waited {segSw.Elapsed.TotalSeconds:F1}s for initial segments");
             }
             ctx.Response.Headers["Cache-Control"] = "no-cache, no-store";
+            ctx.Response.Headers["X-Hls-Start-Offset"] = startOffset.ToString(System.Globalization.CultureInfo.InvariantCulture);
             var pl = BuildSubPlaylist(playlist, urlBase, 0, null);
             Console.WriteLine("[HLS] Serving dynamic playlist from segment 0");
             return Results.Content(pl, "application/vnd.apple.mpegurl");
@@ -438,8 +451,9 @@ public class HlsService
         }
 
         int? mediaSeq = (startSeconds > 0 && !useOriginalForSeek) ? startSegment : null;
+        ctx.Response.Headers["X-Hls-Start-Offset"] = startOffset.ToString(System.Globalization.CultureInfo.InvariantCulture);
         var subPlaylist = BuildSubPlaylist(playlist, urlBase, targetSegment, mediaSeq);
-        Console.WriteLine($"[HLS] Serving sub-playlist from segment {targetSegment}");
+        Console.WriteLine($"[HLS] Serving sub-playlist from segment {targetSegment} (start offset {startOffset:F3}s)");
         return Results.Content(subPlaylist, "application/vnd.apple.mpegurl");
     }
 

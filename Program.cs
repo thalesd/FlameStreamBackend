@@ -18,7 +18,10 @@ var settings = new ServerSettings(
 );
 
 builder.Services.AddCors(o =>
-    o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()));
+    o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()
+        // Exposed so the browser player can read the true stream start offset (see
+        // HandleStreamRequestAsync) and align its clock + subtitle cue timing to it.
+        .WithExposedHeaders("X-Hls-Start-Offset")));
 builder.Services.AddOpenApi();
 
 builder.Services.AddSingleton(settings);
