@@ -34,6 +34,7 @@ builder.Services.AddSingleton<FFprobeService>();
 builder.Services.AddSingleton<HlsService>();
 builder.Services.AddSingleton<MediaLibraryService>();
 builder.Services.AddSingleton<SubtitleService>();
+builder.Services.AddSingleton<ThumbnailService>();
 builder.Services.AddSingleton<WatchHistoryService>();
 builder.Services.AddHostedService<IdleCleanupService>();
 
@@ -158,6 +159,24 @@ app.MapGet("/api/media", (MediaLibraryService lib) =>
 
 app.MapGet("/subs/{**path}", async (HttpContext ctx, string path, SubtitleService subs) =>
     await subs.GetSubtitlesAsync(ctx, path));
+
+// Scene preview frame for the seek-bar hover popup. ?t=<seconds> is snapped to a fixed
+// grid and the extracted JPEG is cached under the title's HLS cache dir.
+app.MapGet("/api/thumb/{**path}", async (HttpContext ctx, string path, double? t, ThumbnailService thumbs) =>
+{
+    try
+    {
+        var src = PathHelper.SafeUnder(settings.LibraryRoot, path);
+        if (!File.Exists(src)) return Results.NotFound();
+        var file = await thumbs.GetOrCreateAsync(src, t ?? 0, ctx.RequestAborted);
+        if (file is null) return Results.StatusCode(500);
+        // Immutable per (path, bucket): safe to cache hard in the browser.
+        ctx.Response.Headers["Cache-Control"] = "public, max-age=86400";
+        return Results.File(file, "image/jpeg");
+    }
+    catch (UnauthorizedAccessException) { return Results.BadRequest(); }
+    catch (OperationCanceledException)  { return Results.Empty; }
+});
 
 app.MapPost("/api/preprocess", async (string path, HlsService hls) =>
 {

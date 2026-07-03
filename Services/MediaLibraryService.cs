@@ -49,6 +49,7 @@ public class MediaLibraryService
                 path = relPath,
                 url       = $"/stream/{escaped}.m3u8",
                 directUrl = $"/media/{escaped}",
+                thumbUrl  = $"/api/thumb/{escaped}",
                 subUrl = (File.Exists(Path.ChangeExtension(f, ".vtt")) || File.Exists(Path.ChangeExtension(f, ".srt")))
                     ? $"/subs/{escaped}"
                     : null,
