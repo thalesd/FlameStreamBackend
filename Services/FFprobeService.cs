@@ -8,7 +8,7 @@ public class FFprobeService
     private static readonly HashSet<string> SupportedSubtitleCodecs = new(StringComparer.OrdinalIgnoreCase)
         { "subrip", "ass", "ssa", "webvtt", "mov_text", "ttml", "sami", "microdvd", "text" };
 
-    public string GetAudioCodec(string inputFile)
+    public (string codec, int channels) GetAudioInfo(string inputFile)
     {
         var psi = CreatePsi();
         psi.ArgumentList.Add("-show_streams"); psi.ArgumentList.Add("-select_streams"); psi.ArgumentList.Add("a:0");
@@ -18,11 +18,13 @@ public class FFprobeService
         var output = proc.StandardOutput.ReadToEnd();
         proc.WaitForExit();
 
-        if (string.IsNullOrEmpty(output)) return "";
+        if (string.IsNullOrEmpty(output)) return ("", 0);
         using var doc = JsonDocument.Parse(output);
         if (!doc.RootElement.TryGetProperty("streams", out var streams) || streams.GetArrayLength() == 0)
-            return "";
-        return streams[0].GetProperty("codec_name").GetString() ?? "";
+            return ("", 0);
+        var codec = streams[0].GetProperty("codec_name").GetString() ?? "";
+        var channels = streams[0].TryGetProperty("channels", out var ch) ? ch.GetInt32() : 0;
+        return (codec, channels);
     }
 
     public List<(int index, string language, string title, string codec)> GetEmbeddedSubtitles(string inputFile)

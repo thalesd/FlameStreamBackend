@@ -39,6 +39,17 @@ builder.Services.AddHostedService<IdleCleanupService>();
 
 var app = builder.Build();
 
+// Ring buffer behind /api/castlog — receiver-side dlog() lines plus the server-side
+// request markers below, so one endpoint shows the whole cast story in order.
+var castLog = new System.Collections.Concurrent.ConcurrentQueue<string>();
+void CastLog(string s)
+{
+    var entry = $"{DateTime.Now:HH:mm:ss.fff} {s}";
+    castLog.Enqueue(entry);
+    while (castLog.Count > 300) castLog.TryDequeue(out _);
+    Console.WriteLine("[CASTLOG] " + entry);
+}
+
 Directory.CreateDirectory(settings.LibraryRoot);
 Directory.CreateDirectory(settings.CacheRoot);
 
@@ -51,8 +62,19 @@ if (app.Environment.IsDevelopment())
 
 app.UseCors();
 
-// Serves wwwroot/ — includes receiver.html for the Chromecast Custom Receiver
-app.UseStaticFiles();
+// Serves wwwroot/ — includes receiver.html for the Chromecast Custom Receiver.
+// Chromecast caches the receiver aggressively; send no-store so each cast pulls the
+// current receiver.html/js (otherwise edits to the custom receiver logic won't take
+// effect on the device without a reboot).
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx =>
+    {
+        var name = ctx.File.Name;
+        if (name.StartsWith("receiver.", StringComparison.OrdinalIgnoreCase))
+            ctx.Context.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    }
+});
 
 var hlsContentTypes = new FileExtensionContentTypeProvider();
 hlsContentTypes.Mappings[".m3u8"] = "application/vnd.apple.mpegurl";
@@ -66,6 +88,12 @@ app.Use(async (ctx, next) =>
 {
     if (ctx.Request.Path.StartsWithSegments("/hls", out var remainder))
     {
+        // Log segment fetches from non-local callers (i.e. the Chromecast) into the cast
+        // relay, so /api/castlog shows whether the TV ever actually pulls media.
+        if (!System.Net.IPAddress.IsLoopback(ctx.Connection.RemoteIpAddress ?? System.Net.IPAddress.Loopback)
+            && !Equals(ctx.Connection.RemoteIpAddress?.ToString(), "192.168.0.50"))
+            CastLog($"[HLS-REQ from {ctx.Connection.RemoteIpAddress}] {ctx.Request.Path}");
+
         var segs = remainder.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries);
         if (segs is { Length: >= 1 })
         {
@@ -102,7 +130,7 @@ app.MapGet("/stopTranscoding", (TranscodeRegistry reg) => reg.StopAll());
 
 app.MapGet("/stream/{**path}", async (HttpContext ctx, string path, HlsService hls) =>
 {
-    Console.WriteLine($"Request received for /stream/{path}");
+    CastLog($"[STREAM-REQ from {ctx.Connection.RemoteIpAddress}] /stream/{path}{ctx.Request.QueryString}");
 
     if (!path.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
         return Results.BadRequest(new { error = "Stream endpoint requires .m3u8 suffix." });
@@ -144,6 +172,20 @@ app.MapPost("/api/preprocess", async (string path, HlsService hls) =>
 });
 
 app.MapGet("/api/jobs", (HlsService hls) => Results.Ok(hls.GetActiveJobs()));
+
+// ── Cast receiver log relay ──────────────────────────────────────────────────
+// The TV's remote-debug port isn't reachable on this device, so the custom receiver
+// POSTs every dlog() line here instead; GET returns the ring buffer (which also
+// carries the server-side /stream and /hls request markers logged above).
+app.MapPost("/api/castlog", async (HttpContext ctx) =>
+{
+    using var reader = new StreamReader(ctx.Request.Body);
+    var line = await reader.ReadToEndAsync();
+    if (line.Length > 2000) line = line[..2000];
+    CastLog(line);
+    return Results.Ok();
+});
+app.MapGet("/api/castlog", () => Results.Text(string.Join("\n", castLog), "text/plain"));
 
 app.MapPost("/api/jobs/{key}/cancel", (string key, HlsService hls) =>
     Results.Ok(new { cancelled = hls.CancelJob(key) }));

@@ -4,16 +4,19 @@
   <meta charset="utf-8">
   <title>FlameStream</title>
   <!--
-    Google Cast Application Framework (CAF) Receiver SDK.
-    <cast-media-player> is a built-in custom element that:
-      - Plays HLS and MP4 streams via Shaka Player
-      - Renders VTT subtitle tracks
-      - Shows a full controls overlay on the TV (seek bar, time, title, CC button)
-      - Receives all commands from the sender app (play/pause/seek/volume/tracks)
+    Custom Cast receiver, self-driven playback edition.
+
+    This TV's CAF PlayerManager fails EVERY load (our HLS, Google's own sample HLS,
+    plain MP4 — LOAD_FAILED 905 within ~25ms, before any network request), while raw
+    <video> + MSE + hls.js on this very page plays the same streams perfectly
+    (verified 2026-07-03 via the /api/castlog relay). So this receiver uses the Cast
+    SDK only for session management and a custom message channel
+    (urn:x-cast:flamestream), and drives playback itself with hls.js — the exact
+    stack the desktop web app uses.
   -->
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-  <!-- Custom seek/offset handling — see receiver.js. Calls context.start() itself. -->
-  <script src="receiver.js"></script>
+  <script src="hls.min.js"></script>
+  <script src="receiver.js" defer></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -23,17 +26,78 @@
       font-family: 'DM Sans', system-ui, sans-serif;
     }
 
-    /* CAF CSS custom properties for <cast-media-player> */
-    cast-media-player {
-      --theme-hue: 215;                          /* blue accent hue */
-      --progress-color:  #3d8bff;                /* seek bar fill */
-      --buffered-color:  rgba(61,139,255,.3);     /* buffered region */
-      --background-color: #0b0e14;               /* letterbox / splash bg */
-      --font-family: 'DM Sans', system-ui, sans-serif;
+    #player {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      object-fit: contain;
+      background: #0b0e14;
     }
+
+    #player::cue {
+      font-family: 'DM Sans', system-ui, sans-serif;
+      font-size: 1.1em;
+      color: #fff;
+      background: transparent;
+      text-shadow:
+        -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000,
+        0 -2px 0 #000, 0 2px 0 #000, -2px 0 0 #000, 2px 0 0 #000;
+    }
+
+    /* Idle splash + title overlay */
+    #splash {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: #f0f2f5;
+      background: #0b0e14;
+      transition: opacity .4s;
+    }
+    #splash.hidden { opacity: 0; pointer-events: none; }
+    #splash .logo { font-size: 44px; }
+    #splash .name { font-size: 26px; font-weight: 600; letter-spacing: .4px; }
+
+    #title-bar {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      padding: 28px 40px;
+      font-size: 26px;
+      font-weight: 600;
+      color: #f0f2f5;
+      background: linear-gradient(rgba(11,14,20,.85), transparent);
+      opacity: 0;
+      transition: opacity .4s;
+      pointer-events: none;
+    }
+    #title-bar.visible { opacity: 1; }
+
+    #state-badge {
+      position: fixed;
+      bottom: 40px; left: 40px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 20px;
+      color: #fff;
+      background: rgba(11,14,20,.7);
+      opacity: 0;
+      transition: opacity .3s;
+      pointer-events: none;
+    }
+    #state-badge.visible { opacity: 1; }
   </style>
 </head>
 <body>
-  <cast-media-player></cast-media-player>
+  <video id="player" autoplay></video>
+  <div id="splash">
+    <div class="logo">🔥</div>
+    <div class="name">FlameStream</div>
+  </div>
+  <div id="title-bar"></div>
+  <div id="state-badge"></div>
 </body>
 </html>

@@ -1,137 +1,272 @@
-// Custom CAF receiver logic for FlameStream.
+// FlameStream custom Cast receiver — self-driven playback edition (2026-07-03).
 //
-// Problem: our backend serves a *growing* HLS playlist while a title is still being
-// transcoded (EXT-X-PLAYLIST-TYPE:EVENT, no EXT-X-ENDLIST yet) and only starts encoding
-// a requested position on demand via /stream/*.m3u8?start=<seconds> (see HlsService in
-// the backend). The web sender (home.component.ts) already knows to re-request that URL
-// with a new ?start= when the user seeks past what's currently loaded. The default
-// <cast-media-player>/Shaka Player used here has no idea that scheme exists, so a native
-// SEEK past the currently-known manifest range just stalls.
+// WHY THIS EXISTS (see also the /api/castlog relay on the backend):
+// This TV's CAF PlayerManager fails EVERY load — our HLS, Google's own public HLS
+// sample, and plain direct MP4 alike — with LOAD_FAILED (905) ~25ms after
+// PLAYER_LOADING and zero network activity. Meanwhile raw <video> + MSE + hls.js on
+// this same page plays those exact streams flawlessly (probe: manifest parsed,
+// segments fetched, playback reached in ~4s). So the Cast SDK here does session
+// management ONLY, and playback is ours:
 //
-// This script intercepts LOAD/SEEK/MEDIA_STATUS so the *receiver* (the one thing that
-// actually knows what's currently loaded) can do the same "reload at a new offset" trick
-// on its own, without any change needed on the sender side.
+//   sender  --urn:x-cast:flamestream-->  this page  --hls.js/MSE-->  <video>
+//
+// Message protocol (JSON over the custom namespace):
+//   sender → receiver:
+//     {type:'load', url, title?, duration?, startTime?, tracks?: [{id,url,name,lang}], activeTrackId?}
+//     {type:'play'} {type:'pause'} {type:'seek', time}          (time = original-file seconds)
+//     {type:'setVolume', level} {type:'setMuted', muted}
+//     {type:'setTrack', id}                                      (null id = subtitles off)
+//   receiver → sender (broadcast ~1s + on change):
+//     {type:'status', t, dur, paused, trackId}
 (function () {
+  const NS = 'urn:x-cast:flamestream';
   const context = cast.framework.CastReceiverContext.getInstance();
-  const playerManager = context.getPlayerManager();
 
-  // How close to the edge of the known manifest we still allow a native (instant) seek.
-  const SEEK_SAFETY_MARGIN_SECONDS = 2;
+  const video      = document.getElementById('player');
+  const splash     = document.getElementById('splash');
+  const titleBar   = document.getElementById('title-bar');
+  const stateBadge = document.getElementById('state-badge');
 
-  // Absolute-time offset of segment 0 in whatever manifest is currently loaded — i.e.
-  // the value of the `start` query param used to load it (0 for the initial/base load).
-  let streamStartOffset = 0;
-
-  function parseStartParam(url) {
-    if (!url) return 0;
-    try {
-      const parsed = new URL(url, self.location.href);
-      const start = parsed.searchParams.get('start');
-      return start ? parseFloat(start) || 0 : 0;
-    } catch (e) {
-      return 0;
+  // ── Debug overlay + backend log relay ───────────────────────────────────────
+  // Set DEBUG = false for normal viewing. dlog() lines go to: console, the compact
+  // on-TV overlay, and POST /api/castlog (readable from any machine on the LAN).
+  const DEBUG = true;
+  let logEl = null;
+  const logLines = [];
+  function renderLog() {
+    if (!DEBUG) return;
+    if (!logEl && document.body) {
+      logEl = document.createElement('div');
+      logEl.style.cssText =
+        'position:fixed;left:8px;bottom:8px;max-width:94vw;max-height:40vh;overflow:hidden;' +
+        'font:13px/1.4 monospace;color:#8f8;background:rgba(0,0,0,.6);padding:6px 9px;' +
+        'border-radius:4px;white-space:pre-wrap;word-break:break-all;z-index:99999;pointer-events:none;';
+      document.body.appendChild(logEl);
     }
+    if (logEl) logEl.textContent = logLines.join('\n');
   }
+  function dlog(msg) {
+    console.log('[FlameStream receiver] ' + msg);
+    if (!DEBUG) return;
+    logLines.push(msg);
+    while (logLines.length > 14) logLines.shift();
+    renderLog();
+    try { fetch('/api/castlog', { method: 'POST', body: msg }); } catch (e) {}
+  }
+  window.addEventListener('error', (e) => dlog('JS ERROR: ' + (e.message || '?') + ' @' + (e.filename || '?') + ':' + (e.lineno || '?')));
+  window.addEventListener('unhandledrejection', (e) => {
+    let r = ''; try { r = JSON.stringify(e.reason); } catch (err) { r = String(e.reason); }
+    dlog('UNHANDLED REJECTION: ' + r);
+  });
+
+  // ── Playback state ──────────────────────────────────────────────────────────
+  let hls = null;
+  let currentUrl = null;        // base stream URL (no ?start)
+  let totalDuration = 0;        // original-file duration, from the sender's library metadata
+  let startOffset = 0;          // absolute time of the current manifest's local 0
+  let tracks = [];              // subtitle tracks offered by the sender
+  let activeTrackId = null;
+  let trackEl = null;
+  let statusTimer = null;
 
   function stripQuery(url) {
-    const idx = url.indexOf('?');
-    return idx === -1 ? url : url.substring(0, idx);
+    const i = url.indexOf('?');
+    return i === -1 ? url : url.substring(0, i);
   }
 
-  // Single source of truth for streamStartOffset: every load — the sender's original
-  // one, or one we trigger ourselves below — flows through here.
-  playerManager.setMessageInterceptor(
-    cast.framework.messages.MessageType.LOAD,
-    (loadRequestData) => {
-      const media = loadRequestData && loadRequestData.media;
-      const url = (media && (media.contentUrl || media.contentId)) || '';
-      streamStartOffset = parseStartParam(url);
-      console.log('[FlameStream receiver] LOAD, streamStartOffset =', streamStartOffset);
-      return loadRequestData;
+  // The backend reports the absolute time of the manifest's local 0 in this header;
+  // it is the served segment's start, not necessarily the requested seek target.
+  // Mirrors applyStartOffsetHeader in the web app.
+  function applyStartOffsetHeader(data) {
+    const raw = data && data.networkDetails && data.networkDetails.getResponseHeader &&
+                data.networkDetails.getResponseHeader('X-Hls-Start-Offset');
+    const s = raw != null ? parseFloat(raw) : NaN;
+    if (isNaN(s) || s === startOffset) return;
+    startOffset = s;
+    dlog('start offset → ' + s.toFixed(2) + 's');
+    if (activeTrackId != null) attachSubtitleTrack(activeTrackId); // re-shift cues
+  }
+
+  // Native cue matching compares against raw video.currentTime, which resets to ~0 on
+  // every (re)load — the backend rewrites cue times by ?shift= to compensate.
+  // Mirrors attachSubtitleTrack in the web app.
+  function attachSubtitleTrack(id) {
+    if (trackEl) { try { trackEl.remove(); } catch (e) {} trackEl = null; }
+    const t = tracks.find((x) => x.id === id);
+    if (!t) return;
+    const el = document.createElement('track');
+    el.kind = 'subtitles';
+    el.label = t.name || 'Legendas';
+    el.srclang = t.lang || 'pt';
+    el.src = startOffset > 0
+      ? t.url + (t.url.indexOf('?') !== -1 ? '&' : '?') + 'shift=' + startOffset
+      : t.url;
+    video.appendChild(el);
+    trackEl = el;
+    el.track.mode = 'showing';
+    dlog('subtitle track ' + id + ' attached (shift=' + startOffset.toFixed(1) + ')');
+  }
+
+  function destroyHls() {
+    if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
+    if (trackEl) { try { trackEl.remove(); } catch (e) {} trackEl = null; }
+  }
+
+  // Loads the stream at an absolute start time. Handles both fresh loads and
+  // out-of-buffer seeks (mirrors loadLocal + reloadFrom in the web app).
+  function loadAt(absoluteStart) {
+    destroyHls();
+    startOffset = absoluteStart; // provisional until X-Hls-Start-Offset corrects it
+
+    const url = absoluteStart > 0 ? currentUrl + '?start=' + absoluteStart : currentUrl;
+    dlog('loadAt ' + absoluteStart.toFixed(1) + 's');
+
+    if (currentUrl.indexOf('.m3u8') === -1) {
+      // Direct file (progressive MP4) — native playback, native seeking.
+      video.src = currentUrl;
+      video.currentTime = absoluteStart;
+      video.play().catch(() => {});
+      if (activeTrackId != null) attachSubtitleTrack(activeTrackId);
+      return;
     }
-  );
 
-  playerManager.setMessageInterceptor(
-    cast.framework.messages.MessageType.SEEK,
-    (seekRequestData) => {
-      const target = seekRequestData && seekRequestData.currentTime;
-      if (typeof target !== 'number' || isNaN(target)) return seekRequestData;
+    // startPosition: 0 — in-progress transcodes are EVENT playlists that hls.js would
+    // otherwise treat as live and start at the encode tip (same as the web app).
+    // Buffer limits sized for TV media stacks: their MSE SourceBuffer quotas are far
+    // smaller than desktop Chrome's (observed: appends start failing around ~35MB with
+    // our ~7MB segments, causing steady retry churn). Keep the forward buffer modest
+    // and let the back buffer be reclaimed aggressively.
+    hls = new Hls({
+      enableWorker: true,
+      startPosition: 0,
+      maxBufferLength: 20,
+      maxMaxBufferLength: 30,
+      maxBufferSize: 30 * 1000 * 1000,
+      backBufferLength: 30,
+    });
+    let lastNonFatal = '';
+    hls.on(Hls.Events.ERROR, (_e, d) => {
+      if (d.fatal) return; // fatal handler below
+      if (d.details !== lastNonFatal) {   // log each distinct issue once, not per retry
+        lastNonFatal = d.details;
+        dlog('hls non-fatal: ' + d.details);
+      }
+    });
+    hls.on(Hls.Events.MANIFEST_LOADED, (_e, d) => applyStartOffsetHeader(d));
+    hls.on(Hls.Events.LEVEL_LOADED, (_e, d) => applyStartOffsetHeader(d));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      video.play().catch(() => {});
+      if (activeTrackId != null) attachSubtitleTrack(activeTrackId);
+    });
+    hls.on(Hls.Events.ERROR, (_e, d) => {
+      if (!d.fatal) return;
+      dlog('hls FATAL ' + d.type + ' / ' + d.details);
+      if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        loadAt(video.currentTime + startOffset); // reload where we were
+      } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR && hls) {
+        hls.recoverMediaError();
+      }
+    });
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+  }
 
-      // mediaInformation.duration reflects how much of the (possibly still-growing)
-      // manifest Shaka currently knows about. NOTE: unverified against a real device —
-      // if this ever reports a non-finite/undefined value for our EVENT-type playlists
-      // (e.g. if CAF classifies an in-progress transcode as a LIVE stream rather than
-      // BUFFERED), we deliberately fall through to "always reload", which is always
-      // correct, just occasionally does an unnecessary reload for an already-available
-      // position. Re-tune this once tested against real Chromecast hardware.
-      const status = playerManager.getMediaStatus();
-      const knownDuration = status && status.mediaInformation && status.mediaInformation.duration;
+  // ── Message handling ────────────────────────────────────────────────────────
+  function sendStatus() {
+    try {
+      context.sendCustomMessage(NS, undefined, {
+        type: 'status',
+        t: video.currentTime + startOffset,
+        dur: totalDuration,
+        paused: video.paused,
+        trackId: activeTrackId,
+      });
+    } catch (e) {}
+  }
 
-      if (typeof knownDuration === 'number' && isFinite(knownDuration) && knownDuration > 0) {
-        const availableStart = streamStartOffset;
-        const availableEnd = streamStartOffset + knownDuration - SEEK_SAFETY_MARGIN_SECONDS;
+  function handleMessage(m) {
+    switch (m.type) {
+      case 'load':
+        currentUrl = stripQuery(m.url);
+        totalDuration = m.duration || 0;
+        tracks = m.tracks || [];
+        activeTrackId = m.activeTrackId != null ? m.activeTrackId : null;
+        titleBar.textContent = m.title || '';
+        splash.classList.add('hidden');
+        titleBar.classList.add('visible');
+        setTimeout(() => titleBar.classList.remove('visible'), 5000);
+        loadAt(m.startTime || 0);
+        clearInterval(statusTimer);
+        statusTimer = setInterval(sendStatus, 1000);
+        break;
 
-        if (target >= availableStart && target <= availableEnd) {
-          // Already within what's been transcoded — let the native seek proceed,
-          // just translate the absolute target back to manifest-local time.
-          seekRequestData.currentTime = target - streamStartOffset;
-          return seekRequestData;
+      case 'play':
+        video.play().catch(() => {});
+        break;
+
+      case 'pause':
+        video.pause();
+        break;
+
+      case 'seek': {
+        const target = m.time;
+        const local = target - startOffset;
+        let buffered = false;
+        for (let i = 0; i < video.buffered.length; i++) {
+          if (local >= video.buffered.start(i) - 1 && local <= video.buffered.end(i)) { buffered = true; break; }
         }
+        // Direct files seek natively anywhere; HLS reloads when outside the buffer
+        // so the backend can start a seek transcode if needed (mirrors the web app).
+        if (buffered || currentUrl.indexOf('.m3u8') === -1) {
+          video.currentTime = currentUrl.indexOf('.m3u8') === -1 ? target : local;
+        } else {
+          loadAt(target);
+        }
+        sendStatus();
+        break;
       }
 
-      // Out of range (or unknown range) — mirror the web player's reloadFrom(): cancel
-      // this seek and issue a fresh LOAD at the target offset instead. The LOAD
-      // interceptor above will pick up the new streamStartOffset once it lands.
-      const mediaInfo = playerManager.getMediaInformation();
-      if (!mediaInfo) return seekRequestData;
+      case 'setVolume':
+        video.volume = Math.max(0, Math.min(1, m.level));
+        break;
 
-      console.log('[FlameStream receiver] Seek to', target, 'is beyond known range — reloading');
+      case 'setMuted':
+        video.muted = !!m.muted;
+        break;
 
-      const baseUrl = stripQuery(mediaInfo.contentUrl || mediaInfo.contentId);
-      const newUrl = `${baseUrl}?start=${target}`;
+      case 'setTrack':
+        activeTrackId = m.id != null ? m.id : null;
+        if (activeTrackId == null) {
+          if (trackEl) trackEl.track.mode = 'hidden';
+        } else {
+          attachSubtitleTrack(activeTrackId);
+        }
+        sendStatus();
+        break;
 
-      const newMediaInfo = Object.assign(new cast.framework.messages.MediaInformation(), mediaInfo);
-      newMediaInfo.contentId = newUrl;
-      newMediaInfo.contentUrl = newUrl;
-
-      // Subtitle cue timestamps are absolute (original-file-relative); the freshly loaded
-      // manifest's media time resets to ~0 at the new offset (same reason the web player
-      // needs the `shift` param — see SubtitleService.cs), so rewrite each subtitle track's
-      // URL to carry the new offset or cues will stop lining up with playback after this reload.
-      if (Array.isArray(mediaInfo.tracks)) {
-        newMediaInfo.tracks = mediaInfo.tracks.map(function (track) {
-          if (!track || !track.trackContentId) return track;
-          var parts = track.trackContentId.split('?');
-          var params = new URLSearchParams(parts[1] || '');
-          params.set('shift', String(target));
-          var clone = Object.assign(Object.create(Object.getPrototypeOf(track)), track);
-          clone.trackContentId = parts[0] + '?' + params.toString();
-          return clone;
-        });
-      }
-
-      const newLoadRequest = new cast.framework.messages.LoadRequestData();
-      newLoadRequest.media = newMediaInfo;
-      newLoadRequest.autoplay = true;
-      if (status && status.activeTrackIds) newLoadRequest.activeTrackIds = status.activeTrackIds;
-
-      playerManager.load(newLoadRequest);
-      return null; // cancel the native seek; the reload above replaces it
+      default:
+        dlog('unknown message type: ' + m.type);
     }
-  );
+  }
 
-  // Outgoing status always reports manifest-local time; add the offset back so the
-  // sender's scrubber/polling (cast.service.ts) sees correct, monotonic absolute time
-  // across a receiver-triggered reload without any sender-side change.
-  playerManager.setMessageInterceptor(
-    cast.framework.messages.MessageType.MEDIA_STATUS,
-    (status) => {
-      if (status && typeof status.currentTime === 'number') {
-        status.currentTime = status.currentTime + streamStartOffset;
-      }
-      return status;
-    }
-  );
+  context.addCustomMessageListener(NS, (event) => {
+    try { handleMessage(event.data || {}); }
+    catch (e) { dlog('message handling failed: ' + e); }
+  });
 
-  context.start();
+  // ── Video element UX ────────────────────────────────────────────────────────
+  video.addEventListener('pause',   () => { stateBadge.textContent = '⏸ Pausado'; stateBadge.classList.add('visible'); sendStatus(); });
+  video.addEventListener('playing', () => { stateBadge.classList.remove('visible'); sendStatus(); });
+  video.addEventListener('waiting', () => { stateBadge.textContent = 'Carregando…'; stateBadge.classList.add('visible'); });
+  video.addEventListener('canplay', () => { if (!video.paused) stateBadge.classList.remove('visible'); });
+  video.addEventListener('ended',   () => { splash.classList.remove('hidden'); sendStatus(); });
+
+  // ── Start ───────────────────────────────────────────────────────────────────
+  context.addEventListener(cast.framework.system.EventType.READY, () => {
+    dlog('=== receiver build 2026-07-04b ready (self-driven hls.js playback) ===');
+  });
+  // No PlayerManager media session ever exists in this receiver, so the platform's
+  // media-based idle timeout would kill the session mid-movie — disable it. The
+  // sender ending the session (or TV input change) still closes the app.
+  context.start({ disableIdleTimeout: true });
 })();

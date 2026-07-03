@@ -150,7 +150,7 @@ public class HlsService
     {
         Directory.CreateDirectory(outDir);
 
-        var audioCodec  = _ffprobe.GetAudioCodec(src);
+        var (audioCodec, audioChannels) = _ffprobe.GetAudioInfo(src);
         var playlist    = Path.Combine(outDir, "stream.m3u8");
         var segPattern  = Path.Combine(outDir, "seg_%05d.ts");
         var ic          = System.Globalization.CultureInfo.InvariantCulture;
@@ -181,7 +181,11 @@ public class HlsService
 
         args.Add("-pix_fmt"); args.Add("yuv420p");
 
-        args.AddRange(audioCodec == "aac"
+        // Copy AAC only when it's mono/stereo. Multichannel AAC (e.g. 5.1 "AAC5.1" rips)
+        // decodes fine in desktop browsers but NOT on Chromecast devices, which only
+        // handle stereo AAC-LC/HE-AAC (5.1 requires AC-3/EAC-3) — copying it through
+        // produced streams that played locally but silently killed the load on the TV.
+        args.AddRange(audioCodec == "aac" && audioChannels is > 0 and <= 2
             ? ["-c:a", "copy"]
             : ["-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000"]);
 
@@ -312,6 +316,25 @@ public class HlsService
 
     public async Task<IResult> HandleStreamRequestAsync(HttpContext ctx, string src, double startSeconds)
     {
+        // Chromecast's HLS stack requires a multivariant (master) playlist and silently
+        // refuses a bare media playlist — the load dies after PLAYER_LOADING without a
+        // single network request (verified against a real device via the /api/castlog
+        // relay). Desktop hls.js accepts either shape, so EVERY top-level request gets a
+        // one-variant master pointing back to this same endpoint with ?pl=media, and the
+        // segment playlist logic below only runs for that inner request.
+        if (ctx.Request.Query["pl"] != "media")
+        {
+            var ic = System.Globalization.CultureInfo.InvariantCulture;
+            var mediaUrl = $"{ctx.Request.Path.ToUriComponent()}?pl=media";
+            if (startSeconds > 0) mediaUrl += $"&start={startSeconds.ToString(ic)}";
+            ctx.Response.Headers["Cache-Control"] = "no-cache, no-store";
+            // CODECS matches what StartFfmpegJob produces: h264 High (amf/nvenc/x264) + stereo AAC-LC.
+            var master = "#EXTM3U\n#EXT-X-VERSION:3\n" +
+                "#EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.640029,mp4a.40.2\"\n" +
+                mediaUrl + "\n";
+            return Results.Content(master, "application/vnd.apple.mpegurl");
+        }
+
         var baseHash     = PathHelper.HashId(src);
         var mainDir      = MainDir(baseHash);
         var mainPlaylist = Path.Combine(mainDir, "stream.m3u8");
