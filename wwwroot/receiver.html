@@ -59,7 +59,7 @@
       transition: opacity .4s;
     }
     #splash.hidden { opacity: 0; pointer-events: none; }
-    #splash .logo { font-size: 44px; }
+    #splash .logo { width: 120px; height: 120px; }
     #splash .name { font-size: 26px; font-weight: 600; letter-spacing: .4px; }
 
     #title-bar {
@@ -94,8 +94,8 @@
 <body>
   <video id="player" autoplay></video>
   <div id="splash">
-    <div class="logo">🔥</div>
-    <div class="name">FlameStream</div>
+    <img class="logo" src="CozyFlameLogoColor.svg" alt="" aria-hidden="true" />
+    <div class="name">CozyFlame Stream</div>
   </div>
   <div id="title-bar"></div>
   <div id="state-badge"></div>
