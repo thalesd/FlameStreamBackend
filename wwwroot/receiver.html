@@ -89,6 +89,43 @@
       pointer-events: none;
     }
     #state-badge.visible { opacity: 1; }
+
+    /* Scrub-to-confirm overlay (D-pad seek). Shown while choosing a seek target; the media
+       is paused and the thumbnail previews the target frame until OK confirms / Back cancels. */
+    #scrub {
+      position: fixed;
+      left: 50%; bottom: 9vh;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      padding: 24px;
+      border-radius: 18px;
+      background: rgba(11,14,20,.85);
+      box-shadow: 0 12px 48px rgba(0,0,0,.6);
+      transition: opacity .2s;
+      z-index: 50;
+    }
+    #scrub.hidden { opacity: 0; pointer-events: none; }
+    #scrub-thumb {
+      width: 384px; height: 216px;
+      object-fit: cover;
+      border-radius: 12px;
+      background: #000;
+      border: 2px solid rgba(255,255,255,.16);
+      opacity: 0;
+      transition: opacity .15s;
+    }
+    #scrub-bar {
+      width: 384px; height: 6px;
+      border-radius: 99px;
+      background: rgba(255,255,255,.2);
+      overflow: hidden;
+    }
+    #scrub-bar-fill { height: 100%; width: 0; background: #ff5a1f; border-radius: 99px; transition: width .1s; }
+    #scrub-time { font-size: 30px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; }
+    #scrub-hint { font-size: 16px; color: rgba(255,255,255,.55); }
   </style>
 </head>
 <body>
@@ -99,5 +136,11 @@
   </div>
   <div id="title-bar"></div>
   <div id="state-badge"></div>
+  <div id="scrub" class="hidden">
+    <img id="scrub-thumb" alt="" />
+    <div id="scrub-bar"><div id="scrub-bar-fill"></div></div>
+    <div id="scrub-time"></div>
+    <div id="scrub-hint">◀ ▶ ajustar &nbsp;·&nbsp; OK confirmar &nbsp;·&nbsp; Voltar cancelar</div>
+  </div>
 </body>
 </html>

@@ -26,6 +26,13 @@
   const splash     = document.getElementById('splash');
   const titleBar   = document.getElementById('title-bar');
   const stateBadge = document.getElementById('state-badge');
+  const scrub      = document.getElementById('scrub');
+  const scrubThumb = document.getElementById('scrub-thumb');
+  const scrubBar   = document.getElementById('scrub-bar-fill');
+  const scrubTime  = document.getElementById('scrub-time');
+  // Fade the preview only once its frame has actually loaded; hide a failed one.
+  scrubThumb.addEventListener('load',  () => { scrubThumb.style.opacity = '1'; });
+  scrubThumb.addEventListener('error', () => { scrubThumb.style.opacity = '0'; });
 
   // ── Debug overlay + backend log relay ───────────────────────────────────────
   // DEBUG toggles ONLY the on-TV overlay. dlog() always goes to the console and to
@@ -55,7 +62,13 @@
     while (logLines.length > 14) logLines.shift();
     renderLog();
   }
-  window.addEventListener('error', (e) => dlog('JS ERROR: ' + (e.message || '?') + ' @' + (e.filename || '?') + ':' + (e.lineno || '?')));
+  window.addEventListener('error', (e) => {
+    // With crossorigin on the SDK script (see receiver.html), e.error carries the real
+    // Error incl. stack — the first frames pinpoint what inside CAF is throwing.
+    let extra = '';
+    if (e.error && e.error.stack) extra = ' :: ' + String(e.error.stack).split('\n').slice(0, 3).join(' | ');
+    dlog('JS ERROR: ' + (e.message || '?') + ' @' + (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?') + extra);
+  });
   window.addEventListener('unhandledrejection', (e) => {
     let r = ''; try { r = JSON.stringify(e.reason); } catch (err) { r = String(e.reason); }
     dlog('UNHANDLED REJECTION: ' + r);
@@ -70,6 +83,19 @@
   let activeTrackId = null;
   let trackEl = null;
   let statusTimer = null;
+  let playerManager = null;     // CAF PlayerManager, used only as the remote-control surface
+
+  // ── D-pad scrub-to-confirm state (#130) ─────────────────────────────────────
+  // The remote is a D-pad, so seeking is a deliberate scrub: Left/Right adjust a target
+  // (media paused, thumbnail previewing it), OK commits, Back cancels — mirroring the web
+  // app. Nothing is sought until commit.
+  let seeking = false;
+  let seekTarget = 0;                 // absolute (original-file) seconds being previewed
+  let wasPlayingBeforeSeek = false;   // restore this play state on commit/cancel
+  let thumbBaseUrl = null;            // /api/thumb/<path> for this title, from the load msg
+  let thumbDebounce = null;
+  const SEEK_STEP = 10;               // seconds per Left/Right press
+  const THUMB_INTERVAL = 10;          // preview grid; matches the backend's bucket size
 
   function stripQuery(url) {
     const i = url.indexOf('?');
@@ -116,18 +142,21 @@
 
   // Loads the stream at an absolute start time. Handles both fresh loads and
   // out-of-buffer seeks (mirrors loadLocal + reloadFrom in the web app).
-  function loadAt(absoluteStart) {
+  // resumePlaying === false keeps the video paused once ready (a commit-seek made while
+  // the media was paused); anything else autoplays, as normal loads should.
+  function loadAt(absoluteStart, resumePlaying) {
     destroyHls();
     startOffset = absoluteStart; // provisional until X-Hls-Start-Offset corrects it
+    const shouldPlay = resumePlaying !== false;
 
     const url = absoluteStart > 0 ? currentUrl + '?start=' + absoluteStart : currentUrl;
-    dlog('loadAt ' + absoluteStart.toFixed(1) + 's');
+    dlog('loadAt ' + absoluteStart.toFixed(1) + 's' + (shouldPlay ? '' : ' (paused)'));
 
     if (currentUrl.indexOf('.m3u8') === -1) {
       // Direct file (progressive MP4) — native playback, native seeking.
       video.src = currentUrl;
       video.currentTime = absoluteStart;
-      video.play().catch(() => {});
+      if (shouldPlay) video.play().catch(() => {}); else video.pause();
       if (activeTrackId != null) attachSubtitleTrack(activeTrackId);
       return;
     }
@@ -157,7 +186,7 @@
     hls.on(Hls.Events.MANIFEST_LOADED, (_e, d) => applyStartOffsetHeader(d));
     hls.on(Hls.Events.LEVEL_LOADED, (_e, d) => applyStartOffsetHeader(d));
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      video.play().catch(() => {});
+      if (shouldPlay) video.play().catch(() => {}); else video.pause();
       if (activeTrackId != null) attachSubtitleTrack(activeTrackId);
     });
     hls.on(Hls.Events.ERROR, (_e, d) => {
@@ -176,7 +205,9 @@
   // Seek to an absolute (original-file) time. Direct files seek natively anywhere;
   // HLS reloads when outside the buffer so the backend can start a seek transcode
   // if needed (mirrors the web app's seek()/reloadFrom()).
-  function doSeek(target) {
+  // resumePlaying (optional): true → play after seeking, false → stay paused; omitted →
+  // leave the current play state untouched (the pre-existing CAF/custom-channel behavior).
+  function doSeek(target, resumePlaying) {
     if (typeof target !== 'number' || isNaN(target) || !currentUrl) return;
     target = Math.max(0, totalDuration > 0 ? Math.min(target, totalDuration - 2) : target);
     const local = target - startOffset;
@@ -186,39 +217,284 @@
     }
     if (buffered || currentUrl.indexOf('.m3u8') === -1) {
       video.currentTime = currentUrl.indexOf('.m3u8') === -1 ? target : local;
+      if (resumePlaying === true) video.play().catch(() => {});
+      else if (resumePlaying === false) video.pause();
     } else {
-      loadAt(target);
+      loadAt(target, resumePlaying);
     }
     sendStatus();
   }
 
+  // Current absolute (original-file) playback position.
+  function absTime() { return video.currentTime + startOffset; }
+
   function togglePlay() {
-    if (video.paused) video.play().catch(() => {}); else video.pause();
+    if (video.paused) { video.play().catch(() => {}); showBadge('▶'); }
+    else { video.pause(); showBadge('⏸ Pausado'); }
   }
 
-  // ── TV remote (empirical) ───────────────────────────────────────────────────
-  // Remote keys normally reach a receiver through the CAF media session — the exact
-  // component that's broken on this TV — so that route is closed. Some Chromecast
-  // built-in runtimes ALSO deliver remote presses as DOM key events to the page;
-  // whether this TV does is unknown, so every key is logged to the castlog (the
-  // verdict) and the plausible media keys are wired up in case they do arrive.
-  window.addEventListener('keydown', (e) => {
-    dlog('remote key: "' + e.key + '" code=' + e.keyCode);
-    switch (e.key) {
-      case ' ':
-      case 'Enter':
-      case 'MediaPlayPause': togglePlay(); break;
-      case 'MediaPlay':      video.play().catch(() => {}); break;
-      case 'MediaPause':     video.pause(); break;
-      case 'MediaStop':      video.pause(); break;
-      case 'ArrowRight':
-      case 'MediaFastForward':
-      case 'MediaTrackNext': doSeek(video.currentTime + startOffset + 10); break;
-      case 'ArrowLeft':
-      case 'MediaRewind':
-      case 'MediaTrackPrevious': doSeek(video.currentTime + startOffset - 10); break;
+  // Relative seek used by every control surface (remote keys, CAF session, sender).
+  function seekBy(delta) {
+    doSeek(absTime() + delta);
+    showBadge(delta >= 0 ? '⏩ +' + delta + 's' : '⏪ ' + delta + 's');
+  }
+
+  function changeVolume(delta) {
+    video.muted = false;
+    video.volume = Math.max(0, Math.min(1, video.volume + delta));
+    showBadge('🔊 ' + Math.round(video.volume * 100) + '%');
+  }
+
+  function formatTime(s) {
+    if (!s || isNaN(s) || s < 0) s = 0;
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+    const mm = (m < 10 && h > 0 ? '0' : '') + m, ss = (sec < 10 ? '0' : '') + sec;
+    return h > 0 ? h + ':' + mm + ':' + ss : m + ':' + ss;
+  }
+
+  // ── Scrub-to-confirm (#130) ─────────────────────────────────────────────────
+  // Enter scrub mode: pause and remember the play state so it can be restored on
+  // commit/cancel. The media element keeps showing its paused frame; the overlay
+  // previews the target.
+  function enterSeek() {
+    seeking = true;
+    wasPlayingBeforeSeek = !video.paused;
+    video.pause();
+    seekTarget = absTime();
+    stateBadge.classList.remove('visible'); // the scrub overlay replaces the pause badge
+    scrub.classList.remove('hidden');
+  }
+
+  // Left/Right nudge the target (entering scrub mode on the first press). No seek yet.
+  function adjustSeek(delta) {
+    if (!seeking) enterSeek();
+    const max = totalDuration > 0 ? totalDuration : seekTarget + delta;
+    seekTarget = Math.max(0, Math.min(seekTarget + delta, max));
+    renderScrub();
+  }
+
+  function renderScrub() {
+    scrubTime.textContent = formatTime(seekTarget) + (totalDuration > 0 ? ' / ' + formatTime(totalDuration) : '');
+    if (totalDuration > 0) scrubBar.style.width = (seekTarget / totalDuration * 100) + '%';
+    if (!thumbBaseUrl) return;
+    // Quantize to the backend's preview grid so we reuse cached frames (one request per
+    // bucket), and debounce so rapid nudges don't fire a request per keypress.
+    const bucket = Math.max(0, Math.floor(seekTarget / THUMB_INTERVAL) * THUMB_INTERVAL);
+    const url = thumbBaseUrl + (thumbBaseUrl.indexOf('?') !== -1 ? '&' : '?') + 't=' + bucket;
+    clearTimeout(thumbDebounce);
+    thumbDebounce = setTimeout(() => { if (scrubThumb.src !== url) scrubThumb.src = url; }, 140);
+  }
+
+  function commitSeek() {
+    if (!seeking) return;
+    const target = seekTarget, resume = wasPlayingBeforeSeek;
+    exitSeekUI();
+    doSeek(target, resume);          // resume the pre-scrub play state at the new position
+    showBadge('⏩ ' + formatTime(target));
+  }
+
+  function cancelSeek() {
+    if (!seeking) return;
+    const resume = wasPlayingBeforeSeek;
+    exitSeekUI();
+    if (resume) video.play().catch(() => {}); else video.pause(); // no seek — just restore state
+  }
+
+  function exitSeekUI() {
+    seeking = false;
+    scrub.classList.add('hidden');
+    clearTimeout(thumbDebounce);
+    scrubThumb.removeAttribute('src');
+    scrubThumb.style.opacity = '0';
+  }
+
+  // Briefly surface a transport action on-screen — the only feedback a viewer gets
+  // that a remote press was received (and a visible confirmation while debugging).
+  let badgeTimer = null;
+  function showBadge(text) {
+    stateBadge.textContent = text;
+    stateBadge.classList.add('visible');
+    clearTimeout(badgeTimer);
+    // Leave the pause badge up; auto-hide transient ones.
+    if (text.indexOf('Pausado') === -1) badgeTimer = setTimeout(() => stateBadge.classList.remove('visible'), 1200);
+  }
+
+  // ── TV remote via DOM key events ────────────────────────────────────────────
+  // Confirmed on this TV (2026-07-04 castlog): the remote is a D-pad — it emits Arrow
+  // keys, Enter (select), and Escape (back) as DOM key events; it has NO dedicated media
+  // transport keys. So playback is driven entirely off the D-pad:
+  //   Enter/Select → play/pause · Left/Right → seek ∓10s · Up/Down → volume ±10%.
+  // The MediaPlay/Pause/FF/RW keyCodes stay mapped for other remotes that do send them.
+  // Matched by e.key first, then numeric keyCode (TV browsers often report only the latter).
+  // The action taken is logged next to the key so the castlog proves the effect, not just
+  // that the press arrived.
+  function handleRemoteKey(e) {
+    const k = e.key, c = e.keyCode;
+    let action = null;
+    if (k === 'ArrowRight' || k === 'MediaFastForward' || k === 'MediaTrackNext' || c === 39 || c === 417 || c === 228) {
+      adjustSeek(SEEK_STEP);  action = 'scrub→' + formatTime(seekTarget);
+    } else if (k === 'ArrowLeft' || k === 'MediaRewind' || k === 'MediaTrackPrevious' || c === 37 || c === 412 || c === 227) {
+      adjustSeek(-SEEK_STEP); action = 'scrub→' + formatTime(seekTarget);
+    } else if (k === ' ' || k === 'Enter' || k === 'MediaPlayPause' || c === 13 || c === 32 || c === 179 || c === 85) {
+      // OK commits an in-progress scrub; otherwise it's play/pause.
+      if (seeking) { commitSeek(); action = 'commit-seek'; }
+      else { togglePlay(); action = video.paused ? 'pause' : 'play'; }
+    } else if (k === 'Escape' || k === 'BrowserBack' || k === 'GoBack' || c === 27 || c === 461 || c === 10009) {
+      // Back cancels a scrub (and is consumed so it doesn't also exit the app); with no
+      // scrub active it's left unmapped so the platform's Back closes the receiver.
+      if (seeking) { cancelSeek(); action = 'cancel-seek'; }
+    } else if (k === 'MediaPlay' || c === 415) {
+      if (seeking) { commitSeek(); action = 'commit-seek'; }
+      else { video.play().catch(() => {}); showBadge('▶'); action = 'play'; }
+    } else if (k === 'MediaPause' || c === 19) {
+      video.pause(); showBadge('⏸ Pausado'); action = 'pause';
+    } else if (k === 'MediaStop' || c === 413) {
+      if (seeking) { cancelSeek(); action = 'cancel-seek'; }
+      else { video.pause(); showBadge('⏸ Pausado'); action = 'stop'; }
+    } else if (k === 'ArrowUp' || c === 38) {
+      changeVolume(0.1);  action = 'vol+';
+    } else if (k === 'ArrowDown' || c === 40) {
+      changeVolume(-0.1); action = 'vol-';
     }
-  });
+    dlog('remote keydown: key="' + e.key + '" code="' + e.code + '" keyCode=' + c +
+         (action ? ' → ' + action : ' (unmapped)'));
+    if (action) { try { e.preventDefault(); } catch (err) {} }
+  }
+  // Capture phase (3rd arg true): window-capture runs top-down BEFORE any document/body
+  // handler the CAF SDK installs, so we log/handle the key even if CAF's handler then
+  // throws (the opaque "Script error." bursts) and stops propagation before the bubble phase.
+  window.addEventListener('keydown', handleRemoteKey, true);
+  // Log keyup too — some TV remotes surface media keys only on release. Log-only, so it
+  // can't double-trigger an action; whichever of keydown/keyup carries the keys shows up
+  // in the castlog for #130 discovery.
+  window.addEventListener('keyup', (e) =>
+    dlog('remote keyup: key="' + e.key + '" code="' + e.code + '" keyCode=' + e.keyCode + ' which=' + e.which), true);
+
+  // ── TV remote via CAF media session ─────────────────────────────────────────
+  // The other (and more common) way a physical remote's transport keys reach a receiver
+  // is as CAF media messages routed through the PlayerManager's media session. This
+  // receiver historically never touched PlayerManager because its LOAD/playback pipeline
+  // is broken on this TV — but the message/session layer is separate, so we register
+  // command interceptors that drive OUR hls.js <video> and advertise a session, WITHOUT
+  // ever calling CAF's load pipeline. Everything is wrapped defensively: any CAF quirk
+  // degrades to the DOM-key + custom-channel paths rather than breaking playback.
+  function setupRemoteBridge() {
+    try {
+      playerManager = context.getPlayerManager();
+      const messages = cast.framework.messages;
+      const MT  = messages.MessageType;
+      const CMD = messages.Command;
+      const PS  = messages.PlayerState;
+
+      // Tell remotes / the Home app which transport controls this session offers.
+      playerManager.setSupportedMediaCommands(
+        CMD.PAUSE | CMD.SEEK | CMD.STREAM_VOLUME | CMD.STREAM_MUTE, true
+      );
+
+      // Known transport commands → drive our own hls.js <video>.
+      const handlers = {
+        [MT.PLAY]:  () => { video.play().catch(() => {}); showBadge('▶'); },
+        [MT.PAUSE]: () => { video.pause(); showBadge('⏸ Pausado'); },
+        [MT.STOP]:  () => { video.pause(); showBadge('⏸ Pausado'); },
+        [MT.SEEK]:  (req) => {
+          // Absolute target for a scrub; relativeTime for the +/- skip keys on some remotes.
+          if (typeof req.currentTime === 'number') { doSeek(req.currentTime); showBadge('⏩'); }
+          else if (typeof req.relativeTime === 'number') { seekBy(req.relativeTime); }
+        },
+        [MT.SET_VOLUME]: (req) => {
+          const v = req.volume || {};
+          if (typeof v.level === 'number') video.volume = Math.max(0, Math.min(1, v.level));
+          if (typeof v.muted === 'boolean') video.muted = v.muted;
+          showBadge('🔊');
+        },
+      };
+
+      // Discovery logging for #130: register a logging interceptor for EVERY media message
+      // type, so /api/castlog reveals exactly what the TV remote emits — not just the keys
+      // we already handle. Known transport commands are handled + logged; everything else is
+      // logged and passed through untouched. The ~1 Hz status polls are excluded so they
+      // don't flood the 300-entry ring buffer.
+      const NOISY = {};
+      NOISY[MT.MEDIA_STATUS] = 1;
+      NOISY[MT.GET_STATUS]   = 1;
+
+      let logged = 0;
+      const unsupported = [];
+      Object.keys(MT).forEach((k) => {
+        const type = MT[k];
+        if (type === MT.MEDIA_STATUS) return; // owned by the status interceptor below
+        try {
+          playerManager.setMessageInterceptor(type, (req) => {
+            if (!NOISY[type]) dlog('CAF msg: ' + type + summarizeReq(req));
+            const h = handlers[type];
+            if (h) {
+              try { h(req || {}); } catch (e) { dlog('CAF handler err: ' + e); }
+              pushCafStatus();
+              return null; // handled on our own player — skip CAF's (broken) default pipeline
+            }
+            return req; // unhandled: logged, passed through so nothing else changes
+          });
+          logged++;
+        } catch (e) { unsupported.push(k); } // enum has types this runtime won't intercept
+      });
+      if (unsupported.length) dlog('interceptors skipped (unsupported by runtime): ' + unsupported.join(', '));
+
+      // CAF isn't driving our element, so make the status it broadcasts reflect OUR real
+      // playback — otherwise the Home app / remote overlay show 0:00 and a wrong state.
+      playerManager.setMessageInterceptor(MT.MEDIA_STATUS, (status) => {
+        try {
+          if (status) {
+            status.currentTime = absTime();
+            status.playerState = video.paused ? PS.PAUSED : PS.PLAYING;
+          }
+        } catch (e) {}
+        return status;
+      });
+
+      dlog('CAF remote bridge ready (logging ' + logged + ' message types)');
+    } catch (e) {
+      playerManager = null;
+      dlog('CAF remote bridge unavailable: ' + e);
+    }
+  }
+
+  // Compact one-line summary of a media request's interesting fields for the castlog.
+  function summarizeReq(req) {
+    if (!req) return '';
+    const bits = [];
+    try {
+      if (typeof req.currentTime  === 'number') bits.push('t=' + req.currentTime);
+      if (typeof req.relativeTime === 'number') bits.push('rel=' + req.relativeTime);
+      if (typeof req.playbackRate === 'number') bits.push('rate=' + req.playbackRate);
+      if (req.volume) bits.push('vol=' + JSON.stringify(req.volume));
+      if (typeof req.userAction !== 'undefined')     bits.push('action=' + req.userAction);
+      if (typeof req.customData !== 'undefined')      bits.push('custom=' + JSON.stringify(req.customData));
+    } catch (e) {}
+    return bits.length ? ' {' + bits.join(', ') + '}' : '';
+  }
+
+  // Publish media info on load so a session exists for the remote to target. Metadata
+  // only — this never invokes CAF's load pipeline (the part that's broken on this TV).
+  function publishCafSession(title, dur) {
+    if (!playerManager) return;
+    try {
+      const info = new cast.framework.messages.MediaInformation();
+      info.contentId    = currentUrl || 'flamestream';
+      info.contentType  = 'application/x-mpegurl';
+      info.streamType   = cast.framework.messages.StreamType.BUFFERED;
+      info.duration     = dur || 0;
+      const meta = new cast.framework.messages.GenericMediaMetadata();
+      meta.title = title || 'CozyFlame Stream';
+      info.metadata = meta;
+      playerManager.setMediaInformation(info, false);
+      dlog('CAF media session published');
+    } catch (e) { dlog('publishCafSession failed: ' + e); }
+  }
+
+  function pushCafStatus() {
+    if (!playerManager) return;
+    try { playerManager.broadcastStatus(true); } catch (e) {}
+  }
 
   // ── Message handling ────────────────────────────────────────────────────────
   function sendStatus() {
@@ -231,20 +507,26 @@
         trackId: activeTrackId,
       });
     } catch (e) {}
+    // Keep the CAF media-session progress/state fresh too (drives the remote overlay
+    // and the Home app), via the MEDIA_STATUS interceptor that injects our real time.
+    pushCafStatus();
   }
 
   function handleMessage(m) {
     switch (m.type) {
       case 'load':
+        exitSeekUI(); // drop any scrub carried over from a previous title
         currentUrl = stripQuery(m.url);
         totalDuration = m.duration || 0;
         tracks = m.tracks || [];
         activeTrackId = m.activeTrackId != null ? m.activeTrackId : null;
+        thumbBaseUrl = m.thumbUrl || null; // /api/thumb/<path> for scrub previews
         titleBar.textContent = m.title || '';
         splash.classList.add('hidden');
         titleBar.classList.add('visible');
         setTimeout(() => titleBar.classList.remove('visible'), 5000);
         loadAt(m.startTime || 0);
+        publishCafSession(m.title, totalDuration);
         clearInterval(statusTimer);
         statusTimer = setInterval(sendStatus, 1000);
         break;
@@ -290,15 +572,16 @@
   });
 
   // ── Video element UX ────────────────────────────────────────────────────────
-  video.addEventListener('pause',   () => { stateBadge.textContent = '⏸ Pausado'; stateBadge.classList.add('visible'); sendStatus(); });
+  video.addEventListener('pause',   () => { if (!seeking) { stateBadge.textContent = '⏸ Pausado'; stateBadge.classList.add('visible'); } sendStatus(); });
   video.addEventListener('playing', () => { stateBadge.classList.remove('visible'); sendStatus(); });
   video.addEventListener('waiting', () => { stateBadge.textContent = 'Carregando…'; stateBadge.classList.add('visible'); });
   video.addEventListener('canplay', () => { if (!video.paused) stateBadge.classList.remove('visible'); });
   video.addEventListener('ended',   () => { splash.classList.remove('hidden'); sendStatus(); });
 
   // ── Start ───────────────────────────────────────────────────────────────────
+  setupRemoteBridge();
   context.addEventListener(cast.framework.system.EventType.READY, () => {
-    dlog('=== receiver build 2026-07-04c ready (self-driven hls.js playback) ===');
+    dlog('=== receiver build 2026-07-04i ready (D-pad scrub-to-confirm w/ thumbnail preview) ===');
   });
   // No PlayerManager media session ever exists in this receiver, so the platform's
   // media-based idle timeout would kill the session mid-movie — disable it. The
