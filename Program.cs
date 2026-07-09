@@ -36,6 +36,7 @@ builder.Services.AddSingleton<MediaLibraryService>();
 builder.Services.AddSingleton<SubtitleService>();
 builder.Services.AddSingleton<ThumbnailService>();
 builder.Services.AddSingleton<WatchHistoryService>();
+builder.Services.AddSingleton<ListService>();
 builder.Services.AddHostedService<IdleCleanupService>();
 
 var app = builder.Build();
@@ -55,6 +56,7 @@ Directory.CreateDirectory(settings.LibraryRoot);
 Directory.CreateDirectory(settings.CacheRoot);
 
 await app.Services.GetRequiredService<WatchHistoryService>().EnsureSchemaAsync();
+await app.Services.GetRequiredService<ListService>().EnsureSchemaAsync();
 
 AppDomain.CurrentDomain.ProcessExit += (_, __) => registry.StopAll();
 
@@ -221,6 +223,23 @@ app.MapPost("/api/watch-history", async (WatchHistoryRequest body, WatchHistoryS
 app.MapGet("/api/continue-watching", async (WatchHistoryService history) =>
     Results.Ok(await history.GetContinueWatchingAsync()));
 
+// ── My List ──────────────────────────────────────────────────────────────────
+app.MapGet("/api/list", async (ListService list) =>
+    Results.Ok(await list.GetAllAsync()));
+
+app.MapPost("/api/list", async (ListRequest body, ListService list) =>
+{
+    await list.AddAsync(body.Path);
+    return Results.Ok();
+});
+
+// POST (not DELETE) to stay within the credential-free wildcard-CORS pattern the frontend uses.
+app.MapPost("/api/list/remove", async (ListRequest body, ListService list) =>
+{
+    await list.RemoveAsync(body.Path);
+    return Results.Ok();
+});
+
 app.MapPost("/api/cache/delete", (string path, HlsService hls) =>
 {
     try
@@ -235,3 +254,4 @@ app.MapPost("/api/cache/delete", (string path, HlsService hls) =>
 app.Run();
 
 record WatchHistoryRequest(string Path, double PositionSeconds, double DurationSeconds);
+record ListRequest(string Path);

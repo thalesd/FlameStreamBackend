@@ -2,9 +2,9 @@
 <html lang="pt">
 <head>
   <meta charset="utf-8">
-  <title>FlameStream</title>
+  <title>CozyFlame Stream</title>
   <!--
-    Custom Cast receiver, self-driven playback edition.
+    Custom Cast receiver, self-driven playback edition — CozyFlame skin (design #t3).
 
     This TV's CAF PlayerManager fails EVERY load (our HLS, Google's own sample HLS,
     plain MP4 — LOAD_FAILED 905 within ~25ms, before any network request), while raw
@@ -13,17 +13,57 @@
     SDK only for session management and a custom message channel
     (urn:x-cast:flamestream), and drives playback itself with hls.js — the exact
     stack the desktop web app uses.
+
+    Because it's a plain full-screen web page (not the restricted CAF media UI) it
+    shares the web app's ember design language: the --cf-* tokens below are ported
+    from src/styles.scss so the TV matches the CozyFlame re-skin.
   -->
   <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-  <script src="hls.min.js"></script>
+  <!-- hls.js is bundled into receiver.js (built from src/receiver/main.ts by `npm run build:receiver`). -->
   <script src="receiver.js" defer></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=Newsreader:ital,wght@0,500;0,600;1,500&display=swap" rel="stylesheet">
   <style>
+    /* ── CozyFlame design tokens (ported from src/styles.scss, design #t3) ──── */
+    :root {
+      --cf-bg:         #0a0806;
+      --cf-bg-2:       #0c0a08;
+      --cf-panel:      rgba(20, 15, 11, 0.94);
+      --cf-panel-soft: rgba(245, 237, 224, 0.06);
+      --cf-panel-hover:rgba(245, 237, 224, 0.12);
+
+      --cf-text:    #f5ede0;
+      --cf-text-70: rgba(245, 237, 224, 0.70);
+      --cf-text-55: rgba(245, 237, 224, 0.55);
+      --cf-text-45: rgba(245, 237, 224, 0.45);
+      --cf-text-35: rgba(245, 237, 224, 0.35);
+
+      --cf-ember: #e2622a;
+      --cf-amber: #f4a52c;
+      --cf-flame: linear-gradient(120deg, #f4a52c, #e2622a);
+      --cf-ink:   #1a1206;
+
+      --cf-line-soft: rgba(245, 237, 224, 0.12);
+      --cf-line-amber: rgba(245, 165, 44, 0.20);
+
+      --cf-r-sm: 10px;
+      --cf-r-md: 14px;
+      --cf-r-lg: 20px;
+      --cf-shadow: 0 40px 90px -30px rgba(0, 0, 0, 0.85);
+      --cf-glow:   0 0 34px rgba(226, 98, 42, 0.5);
+      --cf-font:   'Hanken Grotesk', system-ui, -apple-system, sans-serif;
+      --cf-serif:  'Newsreader', Georgia, serif;
+    }
+
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      background: #0b0e14;
+      background: var(--cf-bg);
       overflow: hidden;
-      font-family: 'DM Sans', system-ui, sans-serif;
+      font-family: var(--cf-font);
+      color: var(--cf-text);
+      -webkit-font-smoothing: antialiased;
     }
 
     #player {
@@ -32,20 +72,30 @@
       width: 100vw;
       height: 100vh;
       object-fit: contain;
-      background: #0b0e14;
+      background: var(--cf-bg);
     }
 
+    /* Subtitle cues — Hanken, warm off-white, heavy outline for legibility over any frame.
+       The .subsize-* classes on <body> scale the caption size (driven from the sender). */
     #player::cue {
-      font-family: 'DM Sans', system-ui, sans-serif;
-      font-size: 1.1em;
+      font-family: var(--cf-font);
+      font-size: 1.15em;
+      line-height: 1.3;
       color: #fff;
       background: transparent;
       text-shadow:
         -2px -2px 0 #000, 2px -2px 0 #000, -2px 2px 0 #000, 2px 2px 0 #000,
         0 -2px 0 #000, 0 2px 0 #000, -2px 0 0 #000, 2px 0 0 #000;
     }
+    body.subsize-small  #player::cue { font-size: 0.92em; }
+    body.subsize-large  #player::cue { font-size: 1.5em; }
 
-    /* Idle splash + title overlay */
+    /* ── Ember ambience (cheap opacity/scale only — TV GPUs choke on animated blur) ── */
+    @keyframes cfFlicker { 0%, 100% { opacity: 0.85; } 45% { opacity: 1; } 70% { opacity: 0.72; } }
+    @keyframes cfGlow    { 0%, 100% { opacity: 0.5; transform: scale(1); } 50% { opacity: 0.82; transform: scale(1.08); } }
+    @keyframes cfRise    { from { opacity: 0; transform: translateY(14px) scale(0.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
+
+    /* ── Idle splash — fireplace glow behind the wordmark ──────────────────── */
     #splash {
       position: fixed;
       inset: 0;
@@ -53,94 +103,284 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 12px;
-      color: #f0f2f5;
-      background: #0b0e14;
-      transition: opacity .4s;
+      gap: 20px;
+      color: var(--cf-text);
+      background:
+        radial-gradient(120% 90% at 50% 118%, rgba(226, 98, 42, 0.30), transparent 58%),
+        radial-gradient(80% 60% at 50% 128%, rgba(244, 165, 44, 0.28), transparent 60%),
+        var(--cf-bg);
+      transition: opacity .5s;
     }
     #splash.hidden { opacity: 0; pointer-events: none; }
-    #splash .logo { width: 120px; height: 120px; }
-    #splash .name { font-size: 26px; font-weight: 600; letter-spacing: .4px; }
+    #splash .glow {
+      position: absolute;
+      left: 50%; bottom: -12%;
+      width: 62vw; height: 62vw;
+      transform: translateX(-50%);
+      background: radial-gradient(circle, rgba(226, 98, 42, 0.42), transparent 62%);
+      filter: blur(8px);
+      animation: cfGlow 7s ease-in-out infinite;
+      pointer-events: none;
+    }
+    #splash .logo { width: 132px; height: 132px; position: relative; animation: cfFlicker 5s ease-in-out infinite; }
+    #splash .name {
+      position: relative;
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: .3px;
+    }
+    #splash .name .amber { color: var(--cf-amber); }
+    #splash .tagline { position: relative; font-family: var(--cf-serif); font-style: italic; font-size: 18px; color: var(--cf-text-55); }
+    /* Floating embers */
+    #splash .ember { position: absolute; border-radius: 50%; pointer-events: none; }
+    #splash .ember.e1 { left: 30%; bottom: 20%; width: 7px; height: 7px; background: var(--cf-amber); box-shadow: 0 0 12px var(--cf-amber); opacity: .7; animation: cfGlow 4s ease-in-out infinite; }
+    #splash .ember.e2 { left: 68%; bottom: 30%; width: 5px; height: 5px; background: var(--cf-ember); box-shadow: 0 0 12px var(--cf-ember); opacity: .6; animation: cfFlicker 3.5s infinite; }
+    #splash .ember.e3 { left: 56%; bottom: 16%; width: 6px; height: 6px; background: var(--cf-amber); box-shadow: 0 0 12px var(--cf-amber); opacity: .5; animation: cfGlow 5.5s ease-in-out infinite; }
 
+    /* ── Title bar (shown briefly on load) ─────────────────────────────────── */
     #title-bar {
       position: fixed;
       top: 0; left: 0; right: 0;
-      padding: 28px 40px;
-      font-size: 26px;
-      font-weight: 600;
-      color: #f0f2f5;
-      background: linear-gradient(rgba(11,14,20,.85), transparent);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 40px 56px;
+      background: linear-gradient(rgba(10, 8, 6, 0.92), transparent);
       opacity: 0;
-      transition: opacity .4s;
+      transition: opacity .45s;
       pointer-events: none;
     }
     #title-bar.visible { opacity: 1; }
+    #title-bar .tb-logo { width: 40px; height: 40px; flex: none; }
+    #title-bar .tb-text { display: flex; flex-direction: column; gap: 2px; }
+    #title-bar .tb-title { font-size: 30px; font-weight: 700; letter-spacing: .2px; }
+    #title-bar .tb-kicker { font-size: 16px; font-weight: 600; letter-spacing: 2.4px; text-transform: uppercase; color: var(--cf-ember); }
 
+    /* ── State badge (play/pause/volume) ───────────────────────────────────── */
     #state-badge {
       position: fixed;
-      bottom: 40px; left: 40px;
-      padding: 8px 16px;
-      border-radius: 8px;
-      font-size: 20px;
-      color: #fff;
-      background: rgba(11,14,20,.7);
+      bottom: 56px; left: 56px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 20px;
+      border-radius: 999px;
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--cf-text);
+      background: var(--cf-panel);
+      border: 1px solid var(--cf-line-soft);
+      box-shadow: var(--cf-shadow);
       opacity: 0;
       transition: opacity .3s;
       pointer-events: none;
     }
     #state-badge.visible { opacity: 1; }
 
-    /* Scrub-to-confirm overlay (D-pad seek). Shown while choosing a seek target; the media
-       is paused and the thumbnail previews the target frame until OK confirms / Back cancels. */
+    /* ── D-pad seek (#130) — mirrors the web player: a full-width progress bar pinned to
+       the bottom, with the scene thumbnail floating ABOVE the bar at the target position
+       (NOT a centred popup). Media is paused while choosing; OK confirms · Back cancels. */
     #scrub {
       position: fixed;
-      left: 50%; bottom: 9vh;
-      transform: translateX(-50%);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 16px;
-      padding: 24px;
-      border-radius: 18px;
-      background: rgba(11,14,20,.85);
-      box-shadow: 0 12px 48px rgba(0,0,0,.6);
-      transition: opacity .2s;
+      left: 0; right: 0;
+      bottom: 7vh;
+      padding: 0 64px;
       z-index: 50;
+      transition: opacity .25s;
     }
     #scrub.hidden { opacity: 0; pointer-events: none; }
-    #scrub-thumb {
-      width: 384px; height: 216px;
-      object-fit: cover;
-      border-radius: 12px;
-      background: #000;
-      border: 2px solid rgba(255,255,255,.16);
-      opacity: 0;
-      transition: opacity .15s;
+    /* Legibility scrim so the bar/time read over bright frames */
+    #scrub::before {
+      content: '';
+      position: fixed;
+      left: 0; right: 0; bottom: 0; height: 30vh;
+      background: linear-gradient(transparent, rgba(10, 8, 6, 0.88));
+      z-index: -1;
+      pointer-events: none;
     }
-    #scrub-bar {
-      width: 384px; height: 6px;
-      border-radius: 99px;
-      background: rgba(255,255,255,.2);
+    .scrub-row { display: flex; align-items: center; gap: 26px; }
+    .scrub-time {
+      font-size: 26px; font-weight: 700;
+      color: var(--cf-text);
+      font-variant-numeric: tabular-nums;
+      min-width: 96px;
+    }
+    .scrub-time.total { color: var(--cf-text-45); }
+
+    .scrub-area { position: relative; flex: 1; height: 8px; }
+    .scrub-track {
+      position: absolute; inset: 0;
+      border-radius: 999px;
+      background: rgba(245, 237, 224, 0.18);
       overflow: hidden;
     }
-    #scrub-bar-fill { height: 100%; width: 0; background: #ff5a1f; border-radius: 99px; transition: width .1s; }
-    #scrub-time { font-size: 30px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; }
-    #scrub-hint { font-size: 16px; color: rgba(255,255,255,.55); }
+    #scrub-bar-fill { height: 100%; width: 0; background: var(--cf-flame); border-radius: 999px; }
+    #scrub-knob {
+      position: absolute; top: 50%; left: 0;
+      width: 22px; height: 22px;
+      transform: translate(-50%, -50%);
+      border-radius: 50%;
+      background: var(--cf-text);
+      box-shadow: 0 0 0 4px rgba(226, 98, 42, 0.55), var(--cf-glow);
+    }
+
+    /* Scene thumbnail floating above the bar, horizontally at the target fraction */
+    #scrub-preview {
+      position: absolute;
+      bottom: 34px; left: 0;
+      transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      animation: cfRise .18s ease-out;
+      pointer-events: none;
+    }
+    #scrub-thumb {
+      width: 336px; height: 189px;
+      object-fit: cover;
+      border-radius: var(--cf-r-md);
+      background: #000;
+      border: 2px solid var(--cf-line-amber);
+      box-shadow: 0 18px 44px -18px rgba(0, 0, 0, 0.9), var(--cf-glow);
+      opacity: 0;
+      transition: opacity .18s;
+    }
+    #scrub-thumb-time {
+      padding: 5px 14px;
+      border-radius: 999px;
+      background: var(--cf-panel);
+      border: 1px solid var(--cf-line-soft);
+      font-size: 21px; font-weight: 700;
+      color: var(--cf-text);
+      font-variant-numeric: tabular-nums;
+    }
+    .scrub-hint { display: flex; justify-content: center; gap: 16px; margin-top: 18px; font-size: 15px; color: var(--cf-text-45); }
+    .keycap {
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .keycap b {
+      display: inline-block;
+      min-width: 24px;
+      padding: 3px 8px;
+      border-radius: 7px;
+      background: var(--cf-panel-soft);
+      border: 1px solid var(--cf-line-soft);
+      color: var(--cf-text-70);
+      font-size: 14px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    /* ── Subtitle menu (D-pad or phone driven) ─────────────────────────────── */
+    #subs {
+      position: fixed;
+      right: 56px; bottom: 56px;
+      width: 380px;
+      max-height: 66vh;
+      padding: 22px;
+      border-radius: var(--cf-r-lg);
+      background: var(--cf-panel);
+      border: 1px solid var(--cf-line-soft);
+      box-shadow: var(--cf-shadow);
+      z-index: 60;
+      animation: cfRise .2s ease-out;
+      transition: opacity .2s;
+    }
+    #subs.hidden { opacity: 0; pointer-events: none; }
+    #subs .subs-head {
+      display: flex; align-items: center; gap: 12px;
+      margin-bottom: 16px;
+      font-size: 15px; font-weight: 700; letter-spacing: 2.4px; text-transform: uppercase;
+      color: var(--cf-ember);
+    }
+    #subs .subs-head svg { width: 22px; height: 22px; fill: currentColor; }
+    #subs-list { display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+    .subs-item {
+      display: flex; align-items: center; gap: 12px;
+      padding: 14px 16px;
+      border-radius: var(--cf-r-sm);
+      font-size: 21px; font-weight: 600;
+      color: var(--cf-text-70);
+      background: transparent;
+      border: 1px solid transparent;
+    }
+    .subs-item .src {
+      font-size: 12px; font-weight: 800; letter-spacing: .6px;
+      padding: 3px 7px; border-radius: 6px;
+      background: rgba(244, 165, 44, 0.20); color: var(--cf-amber);
+    }
+    .subs-item .src.emb { background: rgba(226, 98, 42, 0.22); color: var(--cf-ember); }
+    .subs-item .lang { color: var(--cf-text); }
+    .subs-item .name { color: var(--cf-text-55); font-weight: 500; font-size: 17px; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Focused (cursor) row */
+    .subs-item.focus {
+      background: var(--cf-panel-hover);
+      border-color: var(--cf-line-amber);
+      color: var(--cf-text);
+    }
+    /* Currently-active track */
+    .subs-item.active { color: var(--cf-text); }
+    .subs-item.active::after {
+      content: '';
+      width: 10px; height: 10px; flex: none;
+      border-radius: 50%;
+      background: var(--cf-flame);
+      box-shadow: var(--cf-glow);
+    }
+    .subs-item.focus.active { background: var(--cf-panel-hover); }
+    #subs .subs-hint { margin-top: 16px; display: flex; gap: 14px; font-size: 14px; color: var(--cf-text-45); }
   </style>
 </head>
 <body>
   <video id="player" autoplay></video>
+
   <div id="splash">
+    <span class="ember e1"></span><span class="ember e2"></span><span class="ember e3"></span>
+    <div class="glow"></div>
     <img class="logo" src="CozyFlameLogoColor.svg" alt="" aria-hidden="true" />
-    <div class="name">CozyFlame Stream</div>
+    <div class="name">CozyFlame <span class="amber">Stream</span></div>
+    <div class="tagline">acomode-se junto ao fogo</div>
   </div>
-  <div id="title-bar"></div>
+
+  <div id="title-bar">
+    <img class="tb-logo" src="CozyFlameLogoColor.svg" alt="" aria-hidden="true" />
+    <div class="tb-text">
+      <div class="tb-kicker">Agora reproduzindo</div>
+      <div class="tb-title" id="title-text"></div>
+    </div>
+  </div>
+
   <div id="state-badge"></div>
+
   <div id="scrub" class="hidden">
-    <img id="scrub-thumb" alt="" />
-    <div id="scrub-bar"><div id="scrub-bar-fill"></div></div>
-    <div id="scrub-time"></div>
-    <div id="scrub-hint">◀ ▶ ajustar &nbsp;·&nbsp; OK confirmar &nbsp;·&nbsp; Voltar cancelar</div>
+    <div class="scrub-row">
+      <span class="scrub-time" id="scrub-cur">0:00</span>
+      <div class="scrub-area" id="scrub-area">
+        <div id="scrub-preview">
+          <img id="scrub-thumb" alt="" />
+          <span id="scrub-thumb-time"></span>
+        </div>
+        <div class="scrub-track"><div id="scrub-bar-fill"></div></div>
+        <div id="scrub-knob"></div>
+      </div>
+      <span class="scrub-time total" id="scrub-total">0:00</span>
+    </div>
+    <div class="scrub-hint">
+      <span class="keycap"><b>◀</b><b>▶</b> ajustar</span>
+      <span class="keycap"><b>OK</b> confirmar</span>
+      <span class="keycap"><b>Voltar</b> cancelar</span>
+    </div>
+  </div>
+
+  <div id="subs" class="hidden">
+    <div class="subs-head">
+      <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-9 8H9v-1H7v2h2v1H6v-4h5v2zm7 0h-2v-1h-2v2h2v1h-3v-4h5v2z"/></svg>
+      Legendas
+    </div>
+    <div id="subs-list"></div>
+    <div class="subs-hint">
+      <span class="keycap"><b>▲</b><b>▼</b> navegar</span>
+      <span class="keycap"><b>OK</b> selecionar</span>
+      <span class="keycap"><b>Voltar</b> fechar</span>
+    </div>
   </div>
 </body>
 </html>
