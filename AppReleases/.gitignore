@@ -1,0 +1,8 @@
+# Release binaries are published out-of-band, not committed. Keep the manifest + folder structure.
+*.apk
+*.zip
+*.exe
+*.yml
+*.blockmap
+!.gitignore
+!version.json

@@ -17,6 +17,12 @@ var settings = new ServerSettings(
     HardwareAcceleration:  serverConfig.GetValue<string>("Hls:HardwareAcceleration") ?? "None"
 );
 
+// Self-hosted native-app release channel (APK, OTA web-bundle zip, Windows installer +
+// electron-updater feed). Served under /api/app; manifest is version.json in this folder.
+var appReleasesRoot = Path.GetFullPath(
+    serverConfig.GetValue<string>("AppReleasesRoot")
+    ?? Path.Combine(builder.Environment.ContentRootPath, "AppReleases"));
+
 builder.Services.AddCors(o =>
     o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader()
         // Exposed so the browser player can read the true stream start offset (see
@@ -54,6 +60,9 @@ void CastLog(string s)
 
 Directory.CreateDirectory(settings.LibraryRoot);
 Directory.CreateDirectory(settings.CacheRoot);
+Directory.CreateDirectory(appReleasesRoot);
+Directory.CreateDirectory(Path.Combine(appReleasesRoot, "android"));
+Directory.CreateDirectory(Path.Combine(appReleasesRoot, "windows"));
 
 await app.Services.GetRequiredService<WatchHistoryService>().EnsureSchemaAsync();
 await app.Services.GetRequiredService<ListService>().EnsureSchemaAsync();
@@ -116,6 +125,24 @@ app.UseStaticFiles(new StaticFileOptions
     ContentTypeProvider = hlsContentTypes,
     ServeUnknownFileTypes = true,
     DefaultContentType = "application/octet-stream"
+});
+
+// Native-app update artifacts under /api/app/**: android/bundle.zip (capgo OTA),
+// android/latest.apk (full reinstall), windows/latest.yml + *-Setup.exe (electron-updater).
+// no-store so every launch sees the freshly published release, not a cached one.
+var appContentTypes = new FileExtensionContentTypeProvider();
+appContentTypes.Mappings[".apk"] = "application/vnd.android.package-archive";
+appContentTypes.Mappings[".zip"] = "application/zip";
+appContentTypes.Mappings[".yml"] = "text/yaml";
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(appReleasesRoot),
+    RequestPath  = "/api/app",
+    ContentTypeProvider = appContentTypes,
+    ServeUnknownFileTypes = true,
+    DefaultContentType = "application/octet-stream",
+    OnPrepareResponse = ctx =>
+        ctx.Context.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
 });
 
 app.MapGet("/media/{**path}", (string path) =>
@@ -193,6 +220,20 @@ app.MapPost("/api/preprocess", async (string path, HlsService hls) =>
 });
 
 app.MapGet("/api/jobs", (HlsService hls) => Results.Ok(hls.GetActiveJobs()));
+
+// ── Native-app auto-update manifest ──────────────────────────────────────────
+// Single hand-maintained file the Android/Windows shells poll on launch to decide
+// whether to OTA-swap the web bundle (capgo) or prompt a full reinstall. URLs inside
+// are relative to BACKEND_BASE (see /api/app/** static serving above). Windows uses
+// its own electron-updater latest.yml feed, not this manifest.
+app.MapGet("/api/app/version", (HttpContext ctx) =>
+{
+    var manifest = Path.Combine(appReleasesRoot, "version.json");
+    if (!File.Exists(manifest))
+        return Results.NotFound(new { error = "no release published" });
+    ctx.Response.Headers["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    return Results.Text(File.ReadAllText(manifest), "application/json");
+});
 
 // ── Cast receiver log relay ──────────────────────────────────────────────────
 // The TV's remote-debug port isn't reachable on this device, so the custom receiver

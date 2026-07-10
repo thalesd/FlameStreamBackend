@@ -1,0 +1,13 @@
+{
+  "web": {
+    "version": "1.0.0",
+    "url": "/api/app/android/bundle.zip",
+    "minAndroidVersionCode": 1,
+    "notes": "Initial release."
+  },
+  "androidNative": {
+    "versionCode": 1,
+    "versionName": "1.0.0",
+    "url": "/api/app/android/latest.apk"
+  }
+}
