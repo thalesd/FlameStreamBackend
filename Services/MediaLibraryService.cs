@@ -7,15 +7,29 @@ public class MediaLibraryService
     private static readonly HashSet<string> MediaExts = new(StringComparer.OrdinalIgnoreCase)
         { ".mp4", ".mkv", ".mov", ".avi" };
 
-    private readonly FFprobeService _ffprobe;
+    private readonly MediaInfoCache _infoCache;
     private readonly HlsService _hls;
     private readonly string _libraryRoot;
 
-    public MediaLibraryService(FFprobeService ffprobe, HlsService hls, ServerSettings settings)
+    public MediaLibraryService(MediaInfoCache infoCache, HlsService hls, ServerSettings settings)
     {
-        _ffprobe     = ffprobe;
+        _infoCache   = infoCache;
         _hls         = hls;
         _libraryRoot = settings.LibraryRoot;
+    }
+
+    /// <summary>
+    /// Warm the ffprobe metadata cache for the whole library (parallel, one-time per changed file),
+    /// then build the tree — so the per-file work below is all cheap cache hits + disk checks.
+    /// </summary>
+    public async Task<List<object>> BuildTreeAsync()
+    {
+        var files = Directory
+            .EnumerateFiles(_libraryRoot, "*", SearchOption.AllDirectories)
+            .Where(f => MediaExts.Contains(Path.GetExtension(f)))
+            .ToList();
+        await _infoCache.WarmAsync(files);
+        return BuildTree(_libraryRoot);
     }
 
     public List<object> BuildTree(string dir, string relBase = "")
@@ -34,8 +48,8 @@ public class MediaLibraryService
             var fileName = Path.GetFileName(f);
             var relPath  = string.IsNullOrEmpty(relBase) ? fileName : $"{relBase}/{fileName}";
             var escaped  = string.Join("/", relPath.Split('/').Select(Uri.EscapeDataString));
-            var embedded = _ffprobe.GetEmbeddedSubtitles(f);
-            var (duration, width, height) = _ffprobe.GetMediaInfo(f);
+            var info     = _infoCache.Get(f);
+            var (duration, width, height) = (info.Duration, info.Width, info.Height);
 
             var baseHash     = PathHelper.HashId(f);
             var mainPlaylist = Path.Combine(_hls.MainDir(baseHash), "stream.m3u8");
@@ -53,12 +67,12 @@ public class MediaLibraryService
                 subUrl = (File.Exists(Path.ChangeExtension(f, ".vtt")) || File.Exists(Path.ChangeExtension(f, ".srt")))
                     ? $"/subs/{escaped}"
                     : null,
-                embeddedSubtitles = embedded.Select(s => new
+                embeddedSubtitles = info.Subtitles.Select(s => new
                 {
-                    url = $"/subs/{escaped}?track={s.index}",
-                    s.language,
-                    s.title,
-                    s.codec
+                    url = $"/subs/{escaped}?track={s.Index}",
+                    language = s.Language,
+                    title = s.Title,
+                    codec = s.Codec
                 }).ToArray(),
                 duration,
                 width,

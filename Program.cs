@@ -37,6 +37,7 @@ builder.Services.AddSingleton(registry);
 builder.Services.AddSingleton<IHostedService>(registry);
 
 builder.Services.AddSingleton<FFprobeService>();
+builder.Services.AddSingleton<MediaInfoCache>();
 builder.Services.AddSingleton<HlsService>();
 builder.Services.AddSingleton<MediaLibraryService>();
 builder.Services.AddSingleton<SubtitleService>();
@@ -183,8 +184,8 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path, HlsService h
     }
 });
 
-app.MapGet("/api/media", (MediaLibraryService lib) =>
-    Results.Ok(lib.BuildTree(settings.LibraryRoot)));
+app.MapGet("/api/media", async (MediaLibraryService lib) =>
+    Results.Ok(await lib.BuildTreeAsync()));
 
 app.MapGet("/subs/{**path}", async (HttpContext ctx, string path, SubtitleService subs) =>
     await subs.GetSubtitlesAsync(ctx, path));
