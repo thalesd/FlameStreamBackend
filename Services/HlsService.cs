@@ -163,6 +163,9 @@ public class HlsService
             args.Add(startSeconds.ToString(ic));
         }
 
+        // True when decoded frames stay in GPU memory, which makes a CPU-side -pix_fmt invalid.
+        var framesOnGpu = false;
+
         if (_settings.HardwareAcceleration.Equals("Nvidia", StringComparison.OrdinalIgnoreCase))
         {
             args.AddRange(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda", "-i", src]);
@@ -173,13 +176,24 @@ public class HlsService
             args.AddRange(["-hwaccel", "dxva2", "-i", src]);
             args.AddRange(["-c:v", "h264_amf", "-b:v", "5M", "-profile:v", "high", "-level", "4.1"]);
         }
+        else if (_settings.HardwareAcceleration.Equals("Vaapi", StringComparison.OrdinalIgnoreCase))
+        {
+            // The Linux/homelab GPU path. Needs a real DRM render node, so it is unreachable
+            // under WSL2 (which exposes only /dev/dxg) — see the devices: block in
+            // docker-compose.yml. Decode and encode both stay on the GPU, hence framesOnGpu.
+            // UNTESTED on real hardware: revisit bitrate/level tuning the first time it runs.
+            args.AddRange(["-hwaccel", "vaapi", "-hwaccel_device", "/dev/dri/renderD128",
+                           "-hwaccel_output_format", "vaapi", "-i", src]);
+            args.AddRange(["-c:v", "h264_vaapi", "-b:v", "5M", "-profile:v", "high"]);
+            framesOnGpu = true;
+        }
         else
         {
             args.AddRange(["-i", src]);
             args.AddRange(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-tune", "zerolatency"]);
         }
 
-        args.Add("-pix_fmt"); args.Add("yuv420p");
+        if (!framesOnGpu) { args.Add("-pix_fmt"); args.Add("yuv420p"); }
 
         // Copy AAC only when it's mono/stereo. Multichannel AAC (e.g. 5.1 "AAC5.1" rips)
         // decodes fine in desktop browsers but NOT on Chromecast devices, which only

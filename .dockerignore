@@ -28,3 +28,9 @@ README.md
 !.git/config
 !.git/packed-refs
 !.git/refs/heads/**
+
+# Published native-app artifacts (~13 MB of APK/installer/OTA zip). Bind-mounted at
+# /app-releases instead, so publishing a release doesn't mean rebuilding the image.
+AppReleases
+
+# Nothing below docker/ is ignored — the image copies docker/appsettings.container.json.

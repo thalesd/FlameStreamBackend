@@ -1,0 +1,148 @@
+# Runs the backend under Docker inside the WSL2 Ubuntu-24.04 distro (Docker Engine lives in the
+# distro, not Docker Desktop), so all host paths below are WSL paths:
+#
+#   wsl -d Ubuntu-24.04
+#   cd /mnt/c/Users/Thales/source/repos/FlameStream/FlameStreamBackend
+#   docker compose up --build                 # plain HTTP on :5000
+#   docker compose --profile tls up --build   # + Traefik on :80/:443 with automatic Let's Encrypt
+#
+# ── ON TLS ───────────────────────────────────────────────────────────────────────────────────
+# The backend image speaks plain HTTP and knows nothing about certificates, deliberately. Kestrel
+# reads a cert exactly once when it binds HTTPS, so a renewal inside the app container wouldn't
+# take effect until a restart; more than one replica would race Let's Encrypt into its rate limits;
+# and the DNS API secret has no business being in the app image. TLS is therefore always somebody
+# else's job — which also means this identical image drops into k8s untouched, with cert-manager +
+# an Ingress doing what the `proxy` service does here. Pick one:
+#
+#   A. profile "tls" below — Traefik gets and renews the cert itself (DNS-01 via GoDaddy).
+#      This is the shape the homelab server should use.
+#   B. no proxy, mount a cert Kestrel serves directly — the commented Kestrel__ block on the
+#      backend service. Useful on this Windows box, where Posh-ACME already renews that cert.
+
+services:
+  backend:
+    build:
+      context: .
+    image: flamestream-backend
+    container_name: flamestream-backend
+    restart: unless-stopped
+
+    ports:
+      - "5000:5000"       # plain HTTP, handy for local debugging
+      # HTTPS on the same port the native Windows backend uses, so the frontend, the Cast
+      # receiver URL registered at cast.google.com and the TV all keep working unchanged.
+      - "5001:5001"
+
+    volumes:
+      # Read-only on purpose: the app never writes into LibraryRoot. Everything it derives
+      # (HLS segments, scene thumbs, extracted .vtt, mediainfo.json, the SQLite DBs) lands in
+      # CacheRoot, which keeps an accidental transcode from ever touching the library.
+      - /mnt/d/CozyFlameStream/Media:/media:ro
+
+      # Shared with the Windows run so watch history, My List and already-transcoded titles
+      # carry straight over. DON'T run the Windows backend and this container at the same time —
+      # two processes writing watchhistory.db/mylist.db over the same 9p mount will corrupt or
+      # lock them. If you'd rather isolate the container (and get much faster segment writes on
+      # ext4 instead of /mnt/d), swap this line for the named volume at the bottom of the file:
+      #   - flamestream-cache:/cache
+      - /mnt/d/CozyFlameStream/Cache:/cache
+
+      # Native-app update artifacts served at /api/app/**; published from Windows, so read-only.
+      - ./AppReleases:/app-releases:ro
+
+      # The Let's Encrypt cert, still renewed by Posh-ACME on the Windows side. Read-only.
+      # Drop this (and the Kestrel__ vars) the day Traefik takes over TLS.
+      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/flamestream.tdonsoft.com:/certs:ro
+
+    # Linux server only — hands the GPU render node to the container so VAAPI encode works.
+    # Inert in WSL2: /dev/dri does not exist there, only /dev/dxg. Pair with
+    # Server__Hls__HardwareAcceleration=Vaapi below, and group_add for the render group.
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
+    #   - render
+
+    environment:
+      - TZ=${TZ:-America/Sao_Paulo}
+      - Kestrel__Endpoints__Https__Url=https://0.0.0.0:5001
+      - Kestrel__Endpoints__Https__Certificate__Path=/certs/fullchain.cer
+      - Kestrel__Endpoints__Https__Certificate__KeyPath=/certs/cert.key
+      # Linux server only (see devices: above). CPU x264 everywhere else.
+      # - Server__Hls__HardwareAcceleration=Vaapi
+
+    # Inert unless the tls profile is up (Traefik only picks up containers it can see).
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.flamestream.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+      - traefik.http.routers.flamestream.entrypoints=websecure
+      - traefik.http.routers.flamestream.tls.certresolver=le
+      - traefik.http.services.flamestream.loadbalancer.server.port=5000
+
+    # TranscodeRegistry allows 5 concurrent jobs, which was sized for AMF offload. On CPU x264
+    # five parallel transcodes will saturate the machine and starve WSL2 itself, so give the
+    # container a ceiling. Raise/remove once you've seen how it behaves under real load.
+    cpus: 8
+    mem_limit: 6g
+
+  # ── TLS terminator + ACME client (profile: tls) ────────────────────────────────────────────
+  # Traefik rather than Caddy for one concrete reason: GoDaddy DNS-01 is built into Traefik's
+  # bundled lego, while Caddy would need a custom xcaddy build to get the same provider.
+  #
+  # DNS-01 means issuance needs no inbound port — it works from behind WSL2's NAT. *Serving* on
+  # :80/:443 is the part that needs the LAN to reach this host, which on WSL2 means mirrored
+  # networking mode or a netsh portproxy. On a real Linux server that problem disappears.
+  proxy:
+    image: traefik:v3.3
+    container_name: flamestream-proxy
+    profiles: ["tls"]
+    restart: unless-stopped
+
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Defaulted rather than required (${VAR:?...}) on purpose: compose interpolates this whole
+      # file even for `up` without --profile tls, so a required var here would break the plain
+      # HTTP path for anyone with no .env. Unset creds surface as a clear Traefik startup error.
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL:-}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.le.acme.dnschallenge=true
+      - --certificatesresolvers.le.acme.dnschallenge.provider=godaddy
+      # Public resolvers, so propagation checks don't consult a stale local cache.
+      - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+      # UNCOMMENT FOR THE FIRST RUN. Staging has generous rate limits and issues an untrusted
+      # cert; prove the GoDaddy credentials work here before spending production quota
+      # (5 duplicate certs per week). Delete the letsencrypt volume when switching back.
+      # - --certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
+
+    environment:
+      # lego's GoDaddy provider. Same API key/secret Posh-ACME uses on the Windows side —
+      # see pluginargs.json in the Posh-ACME order folder. Put them in .env (see .env.example);
+      # never inline them here.
+      - GODADDY_API_KEY=${GODADDY_API_KEY:-}
+      - GODADDY_API_SECRET=${GODADDY_API_SECRET:-}
+      - TZ=${TZ:-America/Sao_Paulo}
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      # Read-only, and only so Traefik can watch container labels. If that ever feels like too
+      # much authority, swap the docker provider for the file provider and a static route.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # acme.json holds the account key and the issued certs — this volume IS the cert store.
+      # Back it up, or you re-issue (and re-spend rate limit) on every rebuild.
+      - letsencrypt:/letsencrypt
+
+volumes:
+  # Only used if you switch the /cache mount above to this. Lives on ext4 inside the WSL2 VM,
+  # so segment writes are far faster than /mnt/d — at the cost of not sharing state with Windows.
+  flamestream-cache:
+
+  # Traefik's ACME state. Survives `docker compose down`; removed by `down -v`.
+  letsencrypt:
