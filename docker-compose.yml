@@ -68,16 +68,28 @@ services:
       - Kestrel__Endpoints__Https__Url=https://0.0.0.0:5001
       - Kestrel__Endpoints__Https__Certificate__Path=/certs/fullchain.cer
       - Kestrel__Endpoints__Https__Certificate__KeyPath=/certs/cert.key
+      # DIAGNOSTIC — uncomment to answer "is that device even reaching us, and what did it get
+      # back?". appsettings pins Microsoft.AspNetCore to Warning, which hides all request
+      # logging. Keep it OFF normally: at Information level HLS playback logs a line per segment.
+      # - Logging__LogLevel__Microsoft.AspNetCore=Information
       # Linux server only (see devices: above). CPU x264 everywhere else.
       # - Server__Hls__HardwareAcceleration=Vaapi
 
     # Inert unless the tls profile is up (Traefik only picks up containers it can see).
+    # Everything the backend owns, routed by path so the app and the API share one origin:
+    # the API itself, HLS playlists/segments, direct media, subtitles, and the Cast receiver
+    # page with its logo. Anything not listed here falls through to the frontend container.
+    # Higher priority than the frontend's catch-all so these win regardless of rule length.
     labels:
       - traefik.enable=true
-      - traefik.http.routers.flamestream.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
-      - traefik.http.routers.flamestream.entrypoints=websecure
-      - traefik.http.routers.flamestream.tls.certresolver=le
-      - traefik.http.services.flamestream.loadbalancer.server.port=5000
+      - traefik.http.routers.flamestream-api.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+        && (PathPrefix(`/api`) || PathPrefix(`/stream`) || PathPrefix(`/hls`) || PathPrefix(`/media`)
+        || PathPrefix(`/subs`) || PathPrefix(`/receiver`) || PathPrefix(`/stopTranscoding`)
+        || Path(`/CozyFlameLogoColor.svg`))
+      - traefik.http.routers.flamestream-api.entrypoints=websecure
+      - traefik.http.routers.flamestream-api.tls=true
+      - traefik.http.routers.flamestream-api.priority=100
+      - traefik.http.services.flamestream-api.loadbalancer.server.port=5000
 
     # TranscodeRegistry allows 5 concurrent jobs, which was sized for AMF offload. On CPU x264
     # five parallel transcodes will saturate the machine and starve WSL2 itself, so give the
@@ -105,24 +117,27 @@ services:
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
       - --entrypoints.websecure.address=:443
-      # Defaulted rather than required (${VAR:?...}) on purpose: compose interpolates this whole
-      # file even for `up` without --profile tls, so a required var here would break the plain
-      # HTTP path for anyone with no .env. Unset creds surface as a clear Traefik startup error.
-      - --certificatesresolvers.le.acme.email=${ACME_EMAIL:-}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-      - --certificatesresolvers.le.acme.dnschallenge=true
-      - --certificatesresolvers.le.acme.dnschallenge.provider=godaddy
-      # Public resolvers, so propagation checks don't consult a stale local cache.
-      - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
-      # UNCOMMENT FOR THE FIRST RUN. Staging has generous rate limits and issues an untrusted
-      # cert; prove the GoDaddy credentials work here before spending production quota
-      # (5 duplicate certs per week). Delete the letsencrypt volume when switching back.
+      # Serves the existing Posh-ACME certificate from a file (docker/traefik-dynamic.yml), so
+      # this works today with no ACME account and no GoDaddy credentials.
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      #
+      # ── LINUX SERVER: let Traefik own the certificate ──────────────────────────────────────
+      # Uncomment these four, put the GoDaddy key/secret in .env, add
+      #   traefik.http.routers.<name>.tls.certresolver=le
+      # to both routers, then drop traefik-dynamic.yml and the /certs mount. That is the version
+      # that renews unattended. Do the FIRST run against staging (last line) to prove the
+      # credentials before spending production quota — 5 duplicate certs per week.
+      # - --certificatesresolvers.le.acme.email=${ACME_EMAIL:-}
+      # - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+      # - --certificatesresolvers.le.acme.dnschallenge=true
+      # - --certificatesresolvers.le.acme.dnschallenge.provider=godaddy
+      # - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
       # - --certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
 
     environment:
-      # lego's GoDaddy provider. Same API key/secret Posh-ACME uses on the Windows side —
-      # see pluginargs.json in the Posh-ACME order folder. Put them in .env (see .env.example);
-      # never inline them here.
+      # lego's GoDaddy provider — only read once the ACME flags above are enabled. Same API
+      # key/secret Posh-ACME uses on Windows (see pluginargs.json in the Posh-ACME order folder).
+      # Put them in .env (see .env.example); never inline them here.
       - GODADDY_API_KEY=${GODADDY_API_KEY:-}
       - GODADDY_API_SECRET=${GODADDY_API_SECRET:-}
       - TZ=${TZ:-America/Sao_Paulo}
@@ -135,9 +150,37 @@ services:
       # Read-only, and only so Traefik can watch container labels. If that ever feels like too
       # much authority, swap the docker provider for the file provider and a static route.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # acme.json holds the account key and the issued certs — this volume IS the cert store.
-      # Back it up, or you re-issue (and re-spend rate limit) on every rebuild.
+      - ./docker/traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
+      # The cert Posh-ACME renews on Windows. Not needed once Traefik does ACME itself.
+      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/flamestream.tdonsoft.com:/certs:ro
+      # acme.json holds the account key and the issued certs — this volume IS the cert store
+      # once ACME is enabled. Back it up, or you re-issue on every rebuild.
       - letsencrypt:/letsencrypt
+
+  # ── Frontend: the Angular app, served by nginx ─────────────────────────────────────────────
+  # Same hostname as the backend (Traefik routes by path), which is what lets the built bundle
+  # resolve the API from window.location.origin instead of a baked-in hostname. Catch-all
+  # priority 1 — every backend path is claimed by flamestream-api at priority 100.
+  frontend:
+    build:
+      context: ../FlameStreamFrontend
+    image: flamestream-frontend
+    container_name: flamestream-frontend
+    profiles: ["tls"]
+    restart: unless-stopped
+
+    environment:
+      - TZ=${TZ:-America/Sao_Paulo}
+
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.flamestream-web.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+      - traefik.http.routers.flamestream-web.entrypoints=websecure
+      - traefik.http.routers.flamestream-web.tls=true
+      - traefik.http.routers.flamestream-web.priority=1
+      - traefik.http.services.flamestream-web.loadbalancer.server.port=8080
+
+    mem_limit: 128m
 
 volumes:
   # Only used if you switch the /cache mount above to this. Lives on ext4 inside the WSL2 VM,

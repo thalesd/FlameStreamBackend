@@ -1,6 +1,6 @@
 {
   "web": {
-    "version": "1.0.4",
+    "version": "1.0.3",
     "url": "/api/app/android/bundle.zip",
     "minAndroidVersionCode": 1,
     "notes": "Initial release."
