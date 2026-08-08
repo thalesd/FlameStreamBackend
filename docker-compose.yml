@@ -82,7 +82,15 @@ services:
     # Higher priority than the frontend's catch-all so these win regardless of rule length.
     labels:
       - traefik.enable=true
-      - traefik.http.routers.flamestream-api.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+      # Dois nomes durante a transição para Sága: o novo entra sem derrubar o antigo, que ainda é
+      # o que o receiver de Chromecast tem registrado externamente. O antigo sai quando o Cast
+      # for reapontado.
+      #
+      # ATENÇÃO: sobre HTTPS isto só funciona quando o certificado cobrir OS DOIS nomes. O Traefik
+      # serve um defaultCertificate (docker/traefik-dynamic.yml) e o de hoje é
+      # CN=flamestream.tdonsoft.com apenas — saga.tdonsoft.com dá erro de nome até reemitir.
+      - traefik.http.routers.flamestream-api.rule=(Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+        || Host(`${SAGA_HOST:-saga.tdonsoft.com}`))
         && (PathPrefix(`/api`) || PathPrefix(`/stream`) || PathPrefix(`/hls`) || PathPrefix(`/media`)
         || PathPrefix(`/subs`) || PathPrefix(`/receiver`) || PathPrefix(`/stopTranscoding`)
         || Path(`/CozyFlameLogoColor.svg`))
@@ -175,6 +183,7 @@ services:
     labels:
       - traefik.enable=true
       - traefik.http.routers.flamestream-web.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+        || Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
       - traefik.http.routers.flamestream-web.entrypoints=websecure
       - traefik.http.routers.flamestream-web.tls=true
       - traefik.http.routers.flamestream-web.priority=1
