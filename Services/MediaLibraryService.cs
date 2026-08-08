@@ -84,4 +84,44 @@ public class MediaLibraryService
 
         return entries;
     }
+
+    /// <summary>
+    /// Flat substring search over the library, for callers that want titles rather than a tree.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately does not warm the ffprobe cache: the MCP tools use this to answer "what do I
+    /// have that matches X", and probing every file to answer that would turn a question into a
+    /// minutes-long job. Duration and resolution come from <see cref="BuildTreeAsync"/>, which is
+    /// what the player actually loads.
+    /// </remarks>
+    public List<MediaMatch> Search(string query, int limit = 50)
+    {
+        var matches = new List<MediaMatch>();
+
+        foreach (var file in Directory.EnumerateFiles(_libraryRoot, "*", SearchOption.AllDirectories))
+        {
+            if (!MediaExts.Contains(Path.GetExtension(file))) continue;
+
+            var relPath = Path.GetRelativePath(_libraryRoot, file).Replace('\\', '/');
+
+            if (query.Length > 0 && relPath.Contains(query, StringComparison.OrdinalIgnoreCase) is false)
+            {
+                continue;
+            }
+
+            var escaped = string.Join("/", relPath.Split('/').Select(Uri.EscapeDataString));
+            matches.Add(new MediaMatch(
+                Path.GetFileName(file),
+                relPath,
+                $"/stream/{escaped}.m3u8",
+                _hls.IsPlaylistComplete(Path.Combine(_hls.MainDir(PathHelper.HashId(file)), "stream.m3u8"))));
+
+            if (matches.Count >= limit) break;
+        }
+
+        return matches;
+    }
 }
+
+/// <param name="Ready">Whether the HLS playlist is already built — an unready title plays after a wait.</param>
+public sealed record MediaMatch(string Name, string Path, string StreamUrl, bool Ready);

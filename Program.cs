@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using FlameStreamBackend;
 using FlameStreamBackend.Helpers;
 using FlameStreamBackend.Services;
@@ -45,6 +45,21 @@ builder.Services.AddSingleton<ThumbnailService>();
 builder.Services.AddSingleton<WatchHistoryService>();
 builder.Services.AddSingleton<ListService>();
 builder.Services.AddHostedService<IdleCleanupService>();
+
+// ── MCP ──────────────────────────────────────────────────────────────────────
+// Servidor MCP em /mcp, para o FlameStream contribuir ferramentas ao endpoint agregado do
+// Yggdrasil (lá elas aparecem como flamestream__*, com o prefixo aplicado pelo hub).
+//
+// Não substitui nada: as rotas REST acima continuam sendo o que o player usa. Isto é uma
+// segunda porta, para quem pergunta em vez de assistir.
+builder.Services
+    .AddMcpServer(options => options.ServerInfo = new ModelContextProtocol.Protocol.Implementation
+    {
+        Name = "flamestream",
+        Version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "1.0.0",
+    })
+    .WithHttpTransport()
+    .WithTools<FlameStreamTools>();
 
 var app = builder.Build();
 
@@ -183,6 +198,8 @@ app.MapGet("/stream/{**path}", async (HttpContext ctx, string path, HlsService h
         return Results.BadRequest(new { error = ex.Message });
     }
 });
+
+app.MapMcp("/mcp");
 
 app.MapGet("/api/media", async (MediaLibraryService lib) =>
     Results.Ok(await lib.BuildTreeAsync()));
