@@ -23,8 +23,8 @@ services:
   backend:
     build:
       context: .
-    image: flamestream-backend
-    container_name: flamestream-backend
+    image: saga-backend
+    container_name: saga-backend
     restart: unless-stopped
 
     ports:
@@ -44,7 +44,7 @@ services:
       # two processes writing watchhistory.db/mylist.db over the same 9p mount will corrupt or
       # lock them. If you'd rather isolate the container (and get much faster segment writes on
       # ext4 instead of /mnt/d), swap this line for the named volume at the bottom of the file:
-      #   - flamestream-cache:/cache
+      #   - saga-cache:/cache
       - /mnt/d/CozyFlameStream/Cache:/cache
 
       # Native-app update artifacts served at /api/app/**; published from Windows, so read-only.
@@ -89,15 +89,15 @@ services:
       # ATENÇÃO: sobre HTTPS isto só funciona quando o certificado cobrir OS DOIS nomes. O Traefik
       # serve um defaultCertificate (docker/traefik-dynamic.yml) e o de hoje é
       # CN=flamestream.tdonsoft.com apenas — saga.tdonsoft.com dá erro de nome até reemitir.
-      - traefik.http.routers.flamestream-api.rule=(Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+      - traefik.http.routers.saga-api.rule=(Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
         || Host(`${SAGA_HOST:-saga.tdonsoft.com}`))
         && (PathPrefix(`/api`) || PathPrefix(`/stream`) || PathPrefix(`/hls`) || PathPrefix(`/media`)
         || PathPrefix(`/subs`) || PathPrefix(`/receiver`) || PathPrefix(`/stopTranscoding`)
         || Path(`/CozyFlameLogoColor.svg`))
-      - traefik.http.routers.flamestream-api.entrypoints=websecure
-      - traefik.http.routers.flamestream-api.tls=true
-      - traefik.http.routers.flamestream-api.priority=100
-      - traefik.http.services.flamestream-api.loadbalancer.server.port=5000
+      - traefik.http.routers.saga-api.entrypoints=websecure
+      - traefik.http.routers.saga-api.tls=true
+      - traefik.http.routers.saga-api.priority=100
+      - traefik.http.services.saga-api.loadbalancer.server.port=5000
 
     # TranscodeRegistry allows 5 concurrent jobs, which was sized for AMF offload. On CPU x264
     # five parallel transcodes will saturate the machine and starve WSL2 itself, so give the
@@ -114,7 +114,7 @@ services:
   # networking mode or a netsh portproxy. On a real Linux server that problem disappears.
   proxy:
     image: traefik:v3.3
-    container_name: flamestream-proxy
+    container_name: bifrost
     profiles: ["tls"]
     restart: unless-stopped
 
@@ -172,8 +172,8 @@ services:
   frontend:
     build:
       context: ../FlameStreamFrontend
-    image: flamestream-frontend
-    container_name: flamestream-frontend
+    image: saga-frontend
+    container_name: saga-frontend
     profiles: ["tls"]
     restart: unless-stopped
 
@@ -182,19 +182,19 @@ services:
 
     labels:
       - traefik.enable=true
-      - traefik.http.routers.flamestream-web.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
+      - traefik.http.routers.saga-web.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
         || Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
-      - traefik.http.routers.flamestream-web.entrypoints=websecure
-      - traefik.http.routers.flamestream-web.tls=true
-      - traefik.http.routers.flamestream-web.priority=1
-      - traefik.http.services.flamestream-web.loadbalancer.server.port=8080
+      - traefik.http.routers.saga-web.entrypoints=websecure
+      - traefik.http.routers.saga-web.tls=true
+      - traefik.http.routers.saga-web.priority=1
+      - traefik.http.services.saga-web.loadbalancer.server.port=8080
 
     mem_limit: 128m
 
 volumes:
   # Only used if you switch the /cache mount above to this. Lives on ext4 inside the WSL2 VM,
   # so segment writes are far faster than /mnt/d — at the cost of not sharing state with Windows.
-  flamestream-cache:
+  saga-cache:
 
   # Traefik's ACME state. Survives `docker compose down`; removed by `down -v`.
   letsencrypt:
