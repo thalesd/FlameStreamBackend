@@ -1,4 +1,4 @@
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 public class IdleCleanupService : BackgroundService
 {

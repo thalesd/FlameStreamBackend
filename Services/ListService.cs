@@ -1,6 +1,6 @@
 using Microsoft.Data.Sqlite;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 /// <summary>
 /// "Minha lista" — the user's saved-titles list. SQLite-backed, mirroring

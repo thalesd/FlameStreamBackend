@@ -1,7 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 /// <summary>
 /// Caches the immutable, expensive-to-compute ffprobe results (duration, dimensions, embedded

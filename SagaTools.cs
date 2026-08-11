@@ -1,15 +1,15 @@
 using System.ComponentModel;
 using System.Text.Json;
-using FlameStreamBackend.Services;
+using SagaBackend.Services;
 using ModelContextProtocol.Server;
 
-namespace FlameStreamBackend;
+namespace SagaBackend;
 
 /// <summary>
-/// Ferramentas MCP do FlameStream, publicadas em <c>/mcp</c>.
+/// Ferramentas MCP do Saga, publicadas em <c>/mcp</c>.
 /// </summary>
 /// <remarks>
-/// Sob o Yggdrasil elas aparecem no endpoint agregado como <c>flamestream__*</c>, ao lado das
+/// Sob o Yggdrasil elas aparecem no endpoint agregado como <c>saga__*</c>, ao lado das
 /// dos outros módulos — o prefixo é aplicado pelo hub, não aqui.
 ///
 /// Corte pequeno de propósito: consultar a biblioteca, ver o que ficou pela metade, acompanhar
@@ -17,11 +17,11 @@ namespace FlameStreamBackend;
 /// abrir a interface. Reproduzir vídeo não é tarefa de agente, e por isso não há ferramenta
 /// para isso.
 ///
-/// Nada aqui escreve na biblioteca: o FlameStream monta <c>Media</c> somente leitura de
+/// Nada aqui escreve na biblioteca: o Sága monta <c>Media</c> somente leitura de
 /// propósito, e é o que impede um transcode acidental de tocar no acervo.
 /// </remarks>
 [McpServerToolType]
-public sealed class FlameStreamTools(
+public sealed class SagaTools(
     MediaLibraryService library,
     WatchHistoryService history,
     HlsService hls,

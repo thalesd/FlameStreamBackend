@@ -1,4 +1,4 @@
-// FlameStream custom Cast receiver — self-driven playback edition (2026-07-03).
+// Sága custom Cast receiver — self-driven playback edition (2026-07-03).
 //
 // WHY THIS EXISTS (see also the /api/castlog relay on the backend):
 // This TV's CAF PlayerManager fails EVERY load — our HLS, Google's own public HLS
@@ -8,7 +8,7 @@
 // segments fetched, playback reached in ~4s). So the Cast SDK here does session
 // management ONLY, and playback is ours:
 //
-//   sender  --urn:x-cast:flamestream-->  this page  --hls.js/MSE-->  <video>
+//   sender  --urn:x-cast:saga-->  this page  --hls.js/MSE-->  <video>
 //
 // Message protocol (JSON over the custom namespace):
 //   sender → receiver:
@@ -19,7 +19,7 @@
 //   receiver → sender (broadcast ~1s + on change):
 //     {type:'status', t, dur, paused, trackId}
 (function () {
-  const NS = 'urn:x-cast:flamestream';
+  const NS = 'urn:x-cast:saga';
   const context = cast.framework.CastReceiverContext.getInstance();
 
   const video      = document.getElementById('player');
@@ -55,7 +55,7 @@
     if (logEl) logEl.textContent = logLines.join('\n');
   }
   function dlog(msg) {
-    console.log('[FlameStream receiver] ' + msg);
+    console.log('[Sága receiver] ' + msg);
     try { fetch('/api/castlog', { method: 'POST', body: msg }); } catch (e) {}
     if (!DEBUG) return;
     logLines.push(msg);
@@ -484,7 +484,7 @@
       info.streamType   = cast.framework.messages.StreamType.BUFFERED;
       info.duration     = dur || 0;
       const meta = new cast.framework.messages.GenericMediaMetadata();
-      meta.title = title || 'CozyFlame Stream';
+      meta.title = title || 'Sága';
       info.metadata = meta;
       playerManager.setMediaInformation(info, false);
       dlog('CAF media session published');

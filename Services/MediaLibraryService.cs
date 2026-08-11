@@ -1,6 +1,6 @@
-using FlameStreamBackend.Helpers;
+using SagaBackend.Helpers;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 public class MediaLibraryService
 {

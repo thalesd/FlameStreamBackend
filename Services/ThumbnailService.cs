@@ -1,8 +1,8 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using FlameStreamBackend.Helpers;
+using SagaBackend.Helpers;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 /// <summary>
 /// Generates and caches single-frame JPEG scene previews for the seek-bar hover popup.

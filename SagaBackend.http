@@ -1,0 +1,6 @@
+@SagaBackend_HostAddress = https://saga.tdonsoft.com:5000
+
+GET {{SagaBackend_HostAddress}}/api/media
+Accept: application/json
+
+###

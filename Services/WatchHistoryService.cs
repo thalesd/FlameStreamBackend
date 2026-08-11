@@ -1,6 +1,6 @@
 using Microsoft.Data.Sqlite;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 public sealed record WatchHistoryEntry(string Path, double PositionSeconds, double DurationSeconds, string LastWatchedUtc);
 

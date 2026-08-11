@@ -2,7 +2,7 @@
 # distro, not Docker Desktop), so all host paths below are WSL paths:
 #
 #   wsl -d Ubuntu-24.04
-#   cd /mnt/c/Users/Thales/source/repos/FlameStream/FlameStreamBackend
+#   cd /mnt/c/Users/Thales/source/repos/Saga/SagaBackend
 #   docker compose up --build                 # plain HTTP on :5000
 #   docker compose --profile tls up --build   # + Traefik on :80/:443 with automatic Let's Encrypt
 #
@@ -37,7 +37,7 @@ services:
       # Read-only on purpose: the app never writes into LibraryRoot. Everything it derives
       # (HLS segments, scene thumbs, extracted .vtt, mediainfo.json, the SQLite DBs) lands in
       # CacheRoot, which keeps an accidental transcode from ever touching the library.
-      - /mnt/d/CozyFlameStream/Media:/media:ro
+      - /mnt/d/Saga/Media:/media:ro
 
       # Shared with the Windows run so watch history, My List and already-transcoded titles
       # carry straight over. DON'T run the Windows backend and this container at the same time —
@@ -45,14 +45,14 @@ services:
       # lock them. If you'd rather isolate the container (and get much faster segment writes on
       # ext4 instead of /mnt/d), swap this line for the named volume at the bottom of the file:
       #   - saga-cache:/cache
-      - /mnt/d/CozyFlameStream/Cache:/cache
+      - /mnt/d/Saga/Cache:/cache
 
       # Native-app update artifacts served at /api/app/**; published from Windows, so read-only.
       - ./AppReleases:/app-releases:ro
 
       # The Let's Encrypt cert, still renewed by Posh-ACME on the Windows side. Read-only.
       # Drop this (and the Kestrel__ vars) the day Traefik takes over TLS.
-      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/flamestream.tdonsoft.com:/certs:ro
+      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/saga.tdonsoft.com:/certs:ro
 
     # Linux server only — hands the GPU render node to the container so VAAPI encode works.
     # Inert in WSL2: /dev/dri does not exist there, only /dev/dxg. Pair with
@@ -82,15 +82,12 @@ services:
     # Higher priority than the frontend's catch-all so these win regardless of rule length.
     labels:
       - traefik.enable=true
-      # Dois nomes durante a transição para Sága: o novo entra sem derrubar o antigo, que ainda é
-      # o que o receiver de Chromecast tem registrado externamente. O antigo sai quando o Cast
-      # for reapontado.
+      # Nome único: saga.tdonsoft.com. O antigo flamestream.tdonsoft.com saiu do DNS, então a
+      # rota de transição com os dois nomes foi removida.
       #
-      # ATENÇÃO: sobre HTTPS isto só funciona quando o certificado cobrir OS DOIS nomes. O Traefik
-      # serve um defaultCertificate (docker/traefik-dynamic.yml) e o de hoje é
-      # CN=flamestream.tdonsoft.com apenas — saga.tdonsoft.com dá erro de nome até reemitir.
-      - traefik.http.routers.saga-api.rule=(Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
-        || Host(`${SAGA_HOST:-saga.tdonsoft.com}`))
+      # ATENÇÃO: sobre HTTPS isto exige que o defaultCertificate do Traefik
+      # (docker/traefik-dynamic.yml) cubra saga.tdonsoft.com — veja certs/godaddy.ps1.
+      - traefik.http.routers.saga-api.rule=Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
         && (PathPrefix(`/api`) || PathPrefix(`/stream`) || PathPrefix(`/hls`) || PathPrefix(`/media`)
         || PathPrefix(`/subs`) || PathPrefix(`/receiver`) || PathPrefix(`/stopTranscoding`)
         || Path(`/CozyFlameLogoColor.svg`))
@@ -160,7 +157,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker/traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
       # The cert Posh-ACME renews on Windows. Not needed once Traefik does ACME itself.
-      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/flamestream.tdonsoft.com:/certs:ro
+      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/saga.tdonsoft.com:/certs:ro
       # acme.json holds the account key and the issued certs — this volume IS the cert store
       # once ACME is enabled. Back it up, or you re-issue on every rebuild.
       - letsencrypt:/letsencrypt
@@ -168,10 +165,10 @@ services:
   # ── Frontend: the Angular app, served by nginx ─────────────────────────────────────────────
   # Same hostname as the backend (Traefik routes by path), which is what lets the built bundle
   # resolve the API from window.location.origin instead of a baked-in hostname. Catch-all
-  # priority 1 — every backend path is claimed by flamestream-api at priority 100.
+  # priority 1 — every backend path is claimed by saga-api at priority 100.
   frontend:
     build:
-      context: ../FlameStreamFrontend
+      context: ../SagaFrontend
     image: saga-frontend
     container_name: saga-frontend
     profiles: ["tls"]
@@ -182,8 +179,7 @@ services:
 
     labels:
       - traefik.enable=true
-      - traefik.http.routers.saga-web.rule=Host(`${FLAMESTREAM_HOST:-flamestream.tdonsoft.com}`)
-        || Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
+      - traefik.http.routers.saga-web.rule=Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
       - traefik.http.routers.saga-web.entrypoints=websecure
       - traefik.http.routers.saga-web.tls=true
       - traefik.http.routers.saga-web.priority=1

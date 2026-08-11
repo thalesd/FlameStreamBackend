@@ -1,4 +1,4 @@
-namespace FlameStreamBackend;
+namespace SagaBackend;
 
 public record ServerSettings(
     string LibraryRoot,

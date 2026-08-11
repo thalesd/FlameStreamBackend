@@ -1,4 +1,4 @@
-# FlameStream backend container (Linux/amd64 — built to run under Docker in WSL2).
+# Sága backend container (Linux/amd64 — built to run under Docker in WSL2).
 #
 # Two things the stock ASP.NET image doesn't give us:
 #   1. ffmpeg/ffprobe. Every transcode, scene thumbnail and embedded-subtitle extraction shells
@@ -18,11 +18,11 @@ ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 
 # Restore as its own layer so ordinary code edits don't re-download the package graph.
-COPY FlameStreamBackend.csproj .
-RUN dotnet restore FlameStreamBackend.csproj
+COPY SagaBackend.csproj .
+RUN dotnet restore SagaBackend.csproj
 
 COPY . .
-RUN dotnet publish FlameStreamBackend.csproj -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet publish SagaBackend.csproj -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
 
 
 FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS final
@@ -48,4 +48,4 @@ EXPOSE 5000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://localhost:5000/api/jobs || exit 1
 
-ENTRYPOINT ["dotnet", "FlameStreamBackend.dll"]
+ENTRYPOINT ["dotnet", "SagaBackend.dll"]

@@ -1,7 +1,7 @@
 ﻿using System.Text;
-using FlameStreamBackend;
-using FlameStreamBackend.Helpers;
-using FlameStreamBackend.Services;
+using SagaBackend;
+using SagaBackend.Helpers;
+using SagaBackend.Services;
 using Microsoft.AspNetCore.StaticFiles;
 
 // Required for Encoding.GetEncoding(1252) to work on Linux/Docker
@@ -47,19 +47,19 @@ builder.Services.AddSingleton<ListService>();
 builder.Services.AddHostedService<IdleCleanupService>();
 
 // ── MCP ──────────────────────────────────────────────────────────────────────
-// Servidor MCP em /mcp, para o FlameStream contribuir ferramentas ao endpoint agregado do
-// Yggdrasil (lá elas aparecem como flamestream__*, com o prefixo aplicado pelo hub).
+// Servidor MCP em /mcp, para o Sága contribuir ferramentas ao endpoint agregado do
+// Yggdrasil (lá elas aparecem como saga__*, com o prefixo aplicado pelo hub).
 //
 // Não substitui nada: as rotas REST acima continuam sendo o que o player usa. Isto é uma
 // segunda porta, para quem pergunta em vez de assistir.
 builder.Services
     .AddMcpServer(options => options.ServerInfo = new ModelContextProtocol.Protocol.Implementation
     {
-        Name = "flamestream",
+        Name = "saga",
         Version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "1.0.0",
     })
     .WithHttpTransport()
-    .WithTools<FlameStreamTools>();
+    .WithTools<SagaTools>();
 
 var app = builder.Build();
 

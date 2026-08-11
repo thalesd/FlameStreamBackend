@@ -1,9 +1,9 @@
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
-using FlameStreamBackend.Helpers;
+using SagaBackend.Helpers;
 
-namespace FlameStreamBackend.Services;
+namespace SagaBackend.Services;
 
 public class SubtitleService
 {

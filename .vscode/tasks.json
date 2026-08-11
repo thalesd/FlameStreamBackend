@@ -11,7 +11,7 @@
         "watch",
         "run",
         "--project",
-        "${workspaceFolder}/FlameStreamBackend.csproj"
+        "${workspaceFolder}/SagaBackend.csproj"
       ],
       "problemMatcher": "$msCompile",
       "isBackground": true,
@@ -28,7 +28,7 @@
       "type": "process",
       "args": [
         "build",
-        "${workspaceFolder}/FlameStreamBackend.csproj",
+        "${workspaceFolder}/SagaBackend.csproj",
         "/property:GenerateFullPaths=true",
         "/consoleloggerparameters:NoSummary"
       ],
