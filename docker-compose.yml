@@ -3,21 +3,36 @@
 #
 #   wsl -d Ubuntu-24.04
 #   cd /mnt/c/Users/Thales/source/repos/Saga/SagaBackend
-#   docker compose up --build                 # plain HTTP on :5000
-#   docker compose --profile tls up --build   # + Traefik on :80/:443 with automatic Let's Encrypt
+#   docker compose up --build                 # backend only, plain HTTP on :5000
+#   docker compose --profile tls up --build   # + the Angular frontend, served over HTTPS
 #
-# ── ON TLS ───────────────────────────────────────────────────────────────────────────────────
-# The backend image speaks plain HTTP and knows nothing about certificates, deliberately. Kestrel
-# reads a cert exactly once when it binds HTTPS, so a renewal inside the app container wouldn't
-# take effect until a restart; more than one replica would race Let's Encrypt into its rate limits;
-# and the DNS API secret has no business being in the app image. TLS is therefore always somebody
-# else's job — which also means this identical image drops into k8s untouched, with cert-manager +
-# an Ingress doing what the `proxy` service does here. Pick one:
+# ── ON TLS: THE PROXY MOVED OUT ──────────────────────────────────────────────────────────────
+# The Traefik that terminates TLS used to be a service in this file, named `bifrost`. It now
+# lives in its own repository — ../../Bifrost — because the ingress for the whole homelab has no
+# business belonging to the media server: exposing anything else over HTTPS meant editing this
+# file or fighting a second Traefik for ports 80/443.
 #
-#   A. profile "tls" below — Traefik gets and renews the cert itself (DNS-01 via GoDaddy).
-#      This is the shape the homelab server should use.
-#   B. no proxy, mount a cert Kestrel serves directly — the commented Kestrel__ block on the
-#      backend service. Useful on this Windows box, where Posh-ACME already renews that cert.
+# What stayed here are the LABELS. A route describes the service it points at, so it belongs
+# next to that service. Traefik reads them through the shared `bifrost` network below.
+#
+#   cd /mnt/c/Users/Thales/source/repos/Bifrost && docker compose up -d
+#
+# The backend image still speaks plain HTTP and knows nothing about certificates, deliberately.
+# Kestrel reads a cert exactly once when it binds HTTPS, so a renewal inside the app container
+# wouldn't take effect until a restart; more than one replica would race Let's Encrypt into its
+# rate limits; and the DNS API secret has no business being in the app image. TLS is always
+# somebody else's job — which also means this identical image drops into k8s untouched, with
+# cert-manager + an Ingress doing what the bridge does here.
+#
+# The commented Kestrel__ block on the backend is the other option: no proxy, a cert Kestrel
+# serves directly. It is what the native Windows run used, and it goes away with the Posh-ACME
+# script in phase 7b.
+#
+# ── THE `bifrost` NETWORK IS EXTERNAL, AND MUST EXIST FIRST ──────────────────────────────────
+#   docker network create bifrost
+#
+# Once, and only once — it outlives every stack that hangs off it. `docker compose up` fails
+# with "network bifrost declared as external, but could not be found" if it is missing.
 
 services:
   backend:
@@ -75,7 +90,15 @@ services:
       # Linux server only (see devices: above). CPU x264 everywhere else.
       # - Server__Hls__HardwareAcceleration=Vaapi
 
-    # Inert unless the tls profile is up (Traefik only picks up containers it can see).
+    # Reachable by Traefik under this name, on the shared network. Also keeps publishing
+    # 5000/5001 above: two front doors with different consumers — the bridge speaks the service
+    # name, everything local speaks the port. The bridge being down must not take the backend
+    # with it.
+    networks:
+      - default
+      - bifrost
+
+    # Inert unless the bridge is up (Traefik only picks up containers it can see).
     # Everything the backend owns, routed by path so the app and the API share one origin:
     # the API itself, HLS playlists/segments, direct media, subtitles, and the Cast receiver
     # page with its logo. Anything not listed here falls through to the frontend container.
@@ -86,13 +109,15 @@ services:
       # rota de transição com os dois nomes foi removida.
       #
       # ATENÇÃO: sobre HTTPS isto exige que o defaultCertificate do Traefik
-      # (docker/traefik-dynamic.yml) cubra saga.tdonsoft.com — veja certs/godaddy.ps1.
+      # (../../Bifrost/dynamic/000-default-cert.yml) cubra saga.tdonsoft.com. Na fase 7b este
+      # router ganha `tls.certresolver=le` e aquele arquivo é apagado.
       - traefik.http.routers.saga-api.rule=Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
         && (PathPrefix(`/api`) || PathPrefix(`/stream`) || PathPrefix(`/hls`) || PathPrefix(`/media`)
         || PathPrefix(`/subs`) || PathPrefix(`/receiver`) || PathPrefix(`/stopTranscoding`)
         || Path(`/CozyFlameLogoColor.svg`))
       - traefik.http.routers.saga-api.entrypoints=websecure
       - traefik.http.routers.saga-api.tls=true
+      - traefik.http.routers.saga-api.tls.certresolver=le
       - traefik.http.routers.saga-api.priority=100
       - traefik.http.services.saga-api.loadbalancer.server.port=5000
 
@@ -101,66 +126,6 @@ services:
     # container a ceiling. Raise/remove once you've seen how it behaves under real load.
     cpus: 8
     mem_limit: 6g
-
-  # ── TLS terminator + ACME client (profile: tls) ────────────────────────────────────────────
-  # Traefik rather than Caddy for one concrete reason: GoDaddy DNS-01 is built into Traefik's
-  # bundled lego, while Caddy would need a custom xcaddy build to get the same provider.
-  #
-  # DNS-01 means issuance needs no inbound port — it works from behind WSL2's NAT. *Serving* on
-  # :80/:443 is the part that needs the LAN to reach this host, which on WSL2 means mirrored
-  # networking mode or a netsh portproxy. On a real Linux server that problem disappears.
-  proxy:
-    image: traefik:v3.3
-    container_name: bifrost
-    profiles: ["tls"]
-    restart: unless-stopped
-
-    command:
-      - --providers.docker=true
-      - --providers.docker.exposedbydefault=false
-      - --entrypoints.web.address=:80
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --entrypoints.websecure.address=:443
-      # Serves the existing Posh-ACME certificate from a file (docker/traefik-dynamic.yml), so
-      # this works today with no ACME account and no GoDaddy credentials.
-      - --providers.file.filename=/etc/traefik/dynamic.yml
-      #
-      # ── LINUX SERVER: let Traefik own the certificate ──────────────────────────────────────
-      # Uncomment these four, put the GoDaddy key/secret in .env, add
-      #   traefik.http.routers.<name>.tls.certresolver=le
-      # to both routers, then drop traefik-dynamic.yml and the /certs mount. That is the version
-      # that renews unattended. Do the FIRST run against staging (last line) to prove the
-      # credentials before spending production quota — 5 duplicate certs per week.
-      # - --certificatesresolvers.le.acme.email=${ACME_EMAIL:-}
-      # - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-      # - --certificatesresolvers.le.acme.dnschallenge=true
-      # - --certificatesresolvers.le.acme.dnschallenge.provider=godaddy
-      # - --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
-      # - --certificatesresolvers.le.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory
-
-    environment:
-      # lego's GoDaddy provider — only read once the ACME flags above are enabled. Same API
-      # key/secret Posh-ACME uses on Windows (see pluginargs.json in the Posh-ACME order folder).
-      # Put them in .env (see .env.example); never inline them here.
-      - GODADDY_API_KEY=${GODADDY_API_KEY:-}
-      - GODADDY_API_SECRET=${GODADDY_API_SECRET:-}
-      - TZ=${TZ:-America/Sao_Paulo}
-
-    ports:
-      - "80:80"
-      - "443:443"
-
-    volumes:
-      # Read-only, and only so Traefik can watch container labels. If that ever feels like too
-      # much authority, swap the docker provider for the file provider and a static route.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./docker/traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
-      # The cert Posh-ACME renews on Windows. Not needed once Traefik does ACME itself.
-      - /mnt/c/Users/Thales/AppData/Local/Posh-ACME/LE_PROD/3275644921/saga.tdonsoft.com:/certs:ro
-      # acme.json holds the account key and the issued certs — this volume IS the cert store
-      # once ACME is enabled. Back it up, or you re-issue on every rebuild.
-      - letsencrypt:/letsencrypt
 
   # ── Frontend: the Angular app, served by nginx ─────────────────────────────────────────────
   # Same hostname as the backend (Traefik routes by path), which is what lets the built bundle
@@ -171,16 +136,25 @@ services:
       context: ../SagaFrontend
     image: saga-frontend
     container_name: saga-frontend
+    # The profile name outlived the service it was named after: with Traefik gone from this
+    # file, `--profile tls` no longer starts a TLS terminator, it starts the frontend. The name
+    # stays because it is what the muscle memory, the .bat files and the Yggdrasil stack all
+    # type — and because the frontend is still only reachable over TLS, through the bridge.
     profiles: ["tls"]
     restart: unless-stopped
 
     environment:
       - TZ=${TZ:-America/Sao_Paulo}
 
+    networks:
+      - default
+      - bifrost
+
     labels:
       - traefik.enable=true
       - traefik.http.routers.saga-web.rule=Host(`${SAGA_HOST:-saga.tdonsoft.com}`)
       - traefik.http.routers.saga-web.entrypoints=websecure
+      - traefik.http.routers.saga-web.tls.certresolver=le
       - traefik.http.routers.saga-web.tls=true
       - traefik.http.routers.saga-web.priority=1
       - traefik.http.services.saga-web.loadbalancer.server.port=8080
@@ -192,5 +166,14 @@ volumes:
   # so segment writes are far faster than /mnt/d — at the cost of not sharing state with Windows.
   saga-cache:
 
-  # Traefik's ACME state. Survives `docker compose down`; removed by `down -v`.
-  letsencrypt:
+networks:
+  # The stack's own network, for backend↔frontend. Implicit until `networks:` appeared on the
+  # services above — naming one there means naming all of them.
+  default:
+
+  # The bridge. Created by hand (`docker network create bifrost`) and owned by no stack, because
+  # several hang off it: this one, and the Yggdrasil hub's containers. If it belonged to one of
+  # them, tearing that stack down would take the ingress with it.
+  bifrost:
+    external: true
+    name: bifrost
